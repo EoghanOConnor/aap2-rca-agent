@@ -72,7 +72,7 @@ def fetch_filter_context(
         cur.execute(
             psycopg2.sql.SQL(
                 """SELECT r.id, r.catalog_item, r.root_cause_category,
-                          r.root_cause_summary, e.error_message
+                          r.root_cause->>'summary' AS root_cause_summary, e.error_message
                    FROM {results} r
                    LEFT JOIN {source} e ON r.job_id::text = e.job_id::text
                    WHERE r.confidence = 'high'

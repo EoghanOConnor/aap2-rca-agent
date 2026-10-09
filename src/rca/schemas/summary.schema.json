@@ -92,26 +92,85 @@
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "priority": {
             "type": "string",
             "enum": ["high", "medium", "low"]
           },
           "action": {"type": "string"},
-          "file": {"type": "string"},
           "github_path": {
             "type": "string",
             "description": "GitHub path reference in format 'owner/repo:path/to/file.yml:line' (e.g., 'rhpds/agnosticv:openshift_cnv/account.yaml:42'). Extract from step4 data."
           },
-          "github_url": {"type": "string"},
-          "change": {"type": "string"},
-          "details": {"type": "string"}
+          "details": {"type": "string"},
+          "evidence_ref": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "0-based index into this file's evidence[] array that this recommendation addresses"
+          },
+          "fix": {
+            "description": "null unless a concrete, model-authored patch is proposed. Never set without both status and base_sha.",
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["status", "base_sha"],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": ["proposed"],
+                "description": "Always 'proposed' here -- model-authored, untested"
+              },
+              "base_sha": {
+                "type": "string",
+                "description": "The 'sha' of the fetched file this diff applies to, from step4_github_fetch_history.json's fetched_configs/fetched_workload"
+              },
+              "diff": {"type": ["string", "null"], "description": "Unified diff against the file at base_sha"},
+              "pr_link": {"type": ["string", "null"]}
+            }
+          }
         }
       }
     },
-    "contributing_factors": {
+    "causal_chain": {
       "type": "array",
-      "items": {"type": "string"}
+      "description": "Ordered account of how the failure unfolded -- the direct cause(s) and any contributing factors, each tied back to an evidence entry",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "relationship", "statement"],
+        "properties": {
+          "step": {"type": "integer", "minimum": 1},
+          "relationship": {
+            "type": "string",
+            "enum": ["direct_cause", "contributing_factor"]
+          },
+          "statement": {"type": "string"},
+          "evidence_ref": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "0-based index into this file's evidence[] array that supports this step"
+          }
+        }
+      }
+    },
+    "misidentifications": {
+      "type": "array",
+      "description": "Theories considered and ruled out during the investigation -- only include genuine dead ends, not a list of everything checked",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["theory", "why_suspected", "why_ruled_out"],
+        "properties": {
+          "theory": {"type": "string"},
+          "why_suspected": {"type": "string"},
+          "why_ruled_out": {"type": "string"},
+          "evidence_ref": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "description": "0-based index into this file's evidence[] array that ruled this theory out"
+          }
+        }
+      }
     }
   }
 }

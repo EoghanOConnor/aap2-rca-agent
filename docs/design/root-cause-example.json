@@ -1,0 +1,98 @@
+{
+  "summary": "AWS EC2 RunInstances failed: RequestLimitExceeded during instance launch",
+  "platform": "aws",
+  "failing_role": "aws_instance_create",
+  "failing_github_path": "rhpds/agnosticd:ansible/roles_ocp_workloads/aws_instance_create/tasks/main.yml:34",
+  "analysis_path": "/workspace/.analysis/21/",
+
+  "evidence": [
+    {
+      "source": "aap_job",
+      "job_id": "21",
+      "timestamp": "2026-10-01T14:06:02Z",
+      "message": "Task 'Launch EC2 instance' failed: An error occurred (RequestLimitExceeded) when calling the RunInstances operation",
+      "github_path": null
+    },
+    {
+      "source": "splunk_ocp",
+      "job_id": "21",
+      "timestamp": "2026-10-01T14:06:03Z",
+      "message": "ansible-runner-x7f33 stderr: boto3 retry exhausted after 3 attempts",
+      "github_path": null
+    },
+    {
+      "source": "agnosticd_code",
+      "job_id": "21",
+      "timestamp": null,
+      "message": "amazon.aws.ec2_instance called with no retries/backoff config; inherits boto3 standard mode (3 attempts, no jitter)",
+      "github_path": "rhpds/agnosticd:ansible/roles_ocp_workloads/aws_instance_create/tasks/main.yml:34"
+    },
+    {
+      "source": "related_job",
+      "job_id": "20",
+      "timestamp": "2026-10-01T14:02:55Z",
+      "message": "Job 20 failed with the identical RequestLimitExceeded signature 3 minutes earlier on a different catalog_item (openshift-cnv-single-node)",
+      "github_path": null
+    }
+  ],
+
+  "causal_chain": [
+    {
+      "step": 1,
+      "relationship": "direct_cause",
+      "statement": "AWS throttled RunInstances at the account level during a burst of concurrent provisioning jobs",
+      "evidence_ref": 0
+    },
+    {
+      "step": 2,
+      "relationship": "contributing_factor",
+      "statement": "The instance-creation role sets no retry backoff, so boto3 defaults to 3 attempts with no jitter",
+      "evidence_ref": 2
+    },
+    {
+      "step": 3,
+      "relationship": "direct_cause",
+      "statement": "Retries exhausted before the rate limit cleared, so the task failed and the job aborted",
+      "evidence_ref": 1
+    },
+    {
+      "step": 4,
+      "relationship": "contributing_factor",
+      "statement": "The same signature hit unrelated catalog items in the same window, confirming an account-level limit rather than a per-catalog config fault",
+      "evidence_ref": 3
+    }
+  ],
+
+  "misidentifications": [
+    {
+      "theory": "DNS resolution failure in the provisioning namespace",
+      "why_suspected": "The task aborted at the connection stage, which usually correlates with DNS problems in this environment",
+      "why_ruled_out": "Splunk shows successful DNS resolution 2s before the failure; the error was an AWS API throttle, not a lookup failure",
+      "evidence_ref": 1
+    }
+  ],
+
+  "recommendations": [
+    {
+      "priority": "high",
+      "action": "Add exponential backoff with jitter to the EC2 instance-creation role",
+      "github_path": "rhpds/agnosticd:ansible/roles_ocp_workloads/aws_instance_create/tasks/main.yml:34",
+      "details": "retries: {mode: adaptive, max_attempts: 8}",
+      "evidence_ref": 2,
+      "fix": {
+        "status": "proposed",
+        "base_sha": "a3f91c2",
+        "diff": "--- a/ansible/roles_ocp_workloads/aws_instance_create/tasks/main.yml\n+++ b/ansible/roles_ocp_workloads/aws_instance_create/tasks/main.yml\n@@ -31,6 +31,9 @@\n     instance_type: \"{{ aws_instance_type }}\"\n     image_id: \"{{ aws_ami_id }}\"\n     wait: true\n+    retries:\n+      mode: adaptive\n+      max_attempts: 8\n",
+        "pr_link": null
+      }
+    },
+    {
+      "priority": "medium",
+      "action": "Cap concurrent RunInstances calls per region in the batch scheduler",
+      "github_path": null,
+      "details": "Spreads provisioning load so the account-level limit is not hit in bursts",
+      "evidence_ref": 3,
+      "fix": null
+    }
+  ]
+}

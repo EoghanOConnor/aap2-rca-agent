@@ -17,7 +17,9 @@ DROP TABLE IF EXISTS {SOURCE_TABLE};
 
 CREATE TABLE {SOURCE_TABLE} (
     job_id BIGINT PRIMARY KEY,
-    job_finished TIMESTAMPTZ
+    job_finished TIMESTAMPTZ,
+    ai_processed BOOLEAN,
+    aap2_job_results_fk_id INTEGER
 );
 
 CREATE TABLE {RESULTS_TABLE} (
@@ -28,8 +30,13 @@ CREATE TABLE {RESULTS_TABLE} (
     status TEXT NOT NULL,
     catalog_item TEXT,
     root_cause_category TEXT,
+    root_cause JSONB,
+    job_duration_seconds INTEGER,
+    cross_job_pattern TEXT,
+    cross_job_pattern_description TEXT,
     ticket_link TEXT,
-    ticket_resolve_datetime_gmt TIMESTAMPTZ
+    ticket_resolve_datetime_gmt TIMESTAMPTZ,
+    UNIQUE (batch_id, job_id)
 );
 """
 

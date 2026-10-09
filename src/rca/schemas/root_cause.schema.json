@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Root Cause Detail",
+  "description": "Per-job root-cause detail stored in aap2_job_results.root_cause (JSONB). See docs/design/root-cause-example.json for a worked instance and docs/design/cross-batch-issue-grouping.md for the rationale behind this shape.",
+  "type": "object",
+  "required": ["summary", "evidence", "causal_chain", "misidentifications", "recommendations"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One-line description of the root cause"
+    },
+    "platform": { "type": ["string", "null"] },
+    "failing_role": { "type": ["string", "null"] },
+    "failing_github_path": { "type": ["string", "null"] },
+    "analysis_path": { "type": ["string", "null"] },
+
+    "evidence": {
+      "type": "array",
+      "description": "The only home for code-location pointers. Everything else references an entry by index (evidence_ref).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "job_id", "timestamp", "message", "github_path"],
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": ["aap_job", "splunk_ocp", "agnosticv_config", "agnosticd_code", "related_job"]
+          },
+          "job_id": { "type": "string" },
+          "timestamp": { "type": ["string", "null"] },
+          "message": { "type": "string" },
+          "github_path": { "type": ["string", "null"] }
+        }
+      }
+    },
+
+    "causal_chain": {
+      "type": "array",
+      "description": "Ordered account of how the failure unfolded. Replaces the old flat contributing_factors[] list.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "relationship", "statement", "evidence_ref"],
+        "properties": {
+          "step": { "type": "integer", "minimum": 1 },
+          "relationship": {
+            "type": "string",
+            "enum": ["direct_cause", "contributing_factor"]
+          },
+          "statement": { "type": "string" },
+          "evidence_ref": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      }
+    },
+
+    "misidentifications": {
+      "type": "array",
+      "description": "Theories considered and ruled out during the investigation.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["theory", "why_suspected", "why_ruled_out", "evidence_ref"],
+        "properties": {
+          "theory": { "type": "string" },
+          "why_suspected": { "type": "string" },
+          "why_ruled_out": { "type": "string" },
+          "evidence_ref": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      }
+    },
+
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["priority", "action", "github_path", "details", "evidence_ref", "fix"],
+        "properties": {
+          "priority": { "type": "string", "enum": ["high", "medium", "low"] },
+          "action": { "type": "string" },
+          "github_path": { "type": ["string", "null"] },
+          "details": { "type": ["string", "null"] },
+          "evidence_ref": { "type": ["integer", "null"], "minimum": 0 },
+          "fix": {
+            "description": "null unless a concrete, model-authored patch is proposed. Never render fix.diff without fix.status and fix.base_sha.",
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["status", "base_sha"],
+            "properties": {
+              "status": { "type": "string", "enum": ["proposed", "applied"] },
+              "base_sha": { "type": "string" },
+              "diff": { "type": ["string", "null"] },
+              "pr_link": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    }
+  }
+}

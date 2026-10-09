@@ -10,9 +10,12 @@ import os
 import sys
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from importlib.resources import files
 from typing import Any
 
+import jsonschema
 import psycopg2
+import psycopg2.extras
 import psycopg2.sql
 
 from rca.config import load_database_config
@@ -21,6 +24,122 @@ from rca.database import connect_db, known_issue_active_sql
 MATCH_THRESHOLD = 0.85
 LOOKBACK_HOURS = 4
 
+_ROOT_CAUSE_SCHEMA: dict[str, Any] = json.loads(
+    files("rca").joinpath("schemas").joinpath("root_cause.schema.json").read_text(encoding="utf-8")
+)
+
+
+def _load_step5(analysis_path: str | None, jid: str) -> dict[str, Any] | None:
+    """Read step5_analysis_summary.json from the job's analysis directory, if available."""
+    if not analysis_path:
+        return None
+    path = os.path.join(analysis_path, "step5_analysis_summary.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[WARN] job {jid}: could not read step5 analysis ({path}): {e}", file=sys.stderr)
+        return None
+
+
+def _normalize_evidence(raw: list[Any] | None, jid: str) -> list[dict[str, Any]]:
+    evidence = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        evidence.append(
+            {
+                "source": item.get("source"),
+                "job_id": item.get("job_id") or jid,
+                "timestamp": item.get("timestamp"),
+                "message": item.get("message"),
+                "github_path": item.get("github_path"),
+            }
+        )
+    return evidence
+
+
+def _normalize_fix(fix: Any) -> dict[str, Any] | None:
+    if not isinstance(fix, dict) or not fix.get("status") or not fix.get("base_sha"):
+        return None
+    return {
+        "status": fix.get("status"),
+        "base_sha": fix.get("base_sha"),
+        "diff": fix.get("diff"),
+        "pr_link": fix.get("pr_link"),
+    }
+
+
+def _normalize_recommendations(raw: list[Any] | None) -> list[dict[str, Any]]:
+    recommendations = []
+    for rec in raw or []:
+        if not isinstance(rec, dict):
+            continue
+        recommendations.append(
+            {
+                "priority": rec.get("priority"),
+                "action": rec.get("action"),
+                "github_path": rec.get("github_path"),
+                "details": rec.get("details"),
+                "evidence_ref": rec.get("evidence_ref"),
+                "fix": _normalize_fix(rec.get("fix")),
+            }
+        )
+    return recommendations
+
+
+def _normalize_causal_chain(raw: list[Any] | None) -> list[dict[str, Any]]:
+    causal_chain = []
+    for step in raw or []:
+        if not isinstance(step, dict):
+            continue
+        causal_chain.append(
+            {
+                "step": step.get("step"),
+                "relationship": step.get("relationship"),
+                "statement": step.get("statement"),
+                "evidence_ref": step.get("evidence_ref"),
+            }
+        )
+    return causal_chain
+
+
+def _normalize_misidentifications(raw: list[Any] | None) -> list[dict[str, Any]]:
+    misidentifications = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        misidentifications.append(
+            {
+                "theory": item.get("theory"),
+                "why_suspected": item.get("why_suspected"),
+                "why_ruled_out": item.get("why_ruled_out"),
+                "evidence_ref": item.get("evidence_ref"),
+            }
+        )
+    return misidentifications
+
+
+def build_root_cause(job: dict[str, Any], jid: str) -> dict[str, Any]:
+    """Assemble the root_cause JSONB payload from the job summary and its step5 analysis."""
+    step5 = _load_step5(job.get("analysis_path"), jid) or {}
+    root_cause = {
+        "summary": job.get("root_cause_summary", ""),
+        "platform": job.get("platform"),
+        "failing_role": job.get("failing_role"),
+        "failing_github_path": job.get("failing_github_path"),
+        "analysis_path": job.get("analysis_path"),
+        "evidence": _normalize_evidence(step5.get("evidence"), jid),
+        "causal_chain": _normalize_causal_chain(step5.get("causal_chain")),
+        "misidentifications": _normalize_misidentifications(step5.get("misidentifications")),
+        "recommendations": _normalize_recommendations(step5.get("recommendations")),
+    }
+    try:
+        jsonschema.validate(instance=root_cause, schema=_ROOT_CAUSE_SCHEMA)
+    except jsonschema.ValidationError as e:
+        print(f"[WARN] job {jid}: assembled root_cause failed schema validation: {e.message}", file=sys.stderr)
+    return root_cause
+
 
 def find_match(cur: Any, results_table: str, job: dict[str, Any]) -> int | None:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
@@ -28,7 +147,7 @@ def find_match(cur: Any, results_table: str, job: dict[str, Any]) -> int | None:
 
     cur.execute(
         psycopg2.sql.SQL(
-            """SELECT id, root_cause_summary FROM {}
+            """SELECT id, root_cause->>'summary' AS root_cause_summary FROM {}
                WHERE root_cause_category = %s AND catalog_item = %s
                  AND confidence = 'high' AND batch_id >= %s
                  AND {active}"""
@@ -45,11 +164,11 @@ def find_match(cur: Any, results_table: str, job: dict[str, Any]) -> int | None:
             existing_summary = row["root_cause_summary"]
         else:
             row_id, existing_summary = row
-        ratio = difflib.SequenceMatcher(None, summary, existing_summary).ratio()
+        ratio = difflib.SequenceMatcher(None, summary, existing_summary or "").ratio()
         if ratio >= MATCH_THRESHOLD:
             print(f"[MATCH] job {job.get('job_id')} ({ratio:.0%}) -> result {row_id}")
             print(f"  Current:    {summary[:120]}")
-            print(f"  Historical: {existing_summary[:120]}")
+            print(f"  Historical: {(existing_summary or '')[:120]}")
             return row_id
     return None
 
@@ -118,7 +237,7 @@ def store_report(
                 cur.execute(
                     psycopg2.sql.SQL(
                         """INSERT INTO {}
-                           (batch_id, job_id, status, root_cause_category, root_cause_summary,
+                           (batch_id, job_id, status, root_cause_category, root_cause,
                             confidence, catalog_item, job_duration_seconds)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (batch_id, job_id) DO UPDATE SET status = EXCLUDED.status
@@ -129,7 +248,7 @@ def store_report(
                         jid,
                         job.get("status"),
                         job.get("root_cause_category"),
-                        job.get("root_cause_summary"),
+                        psycopg2.extras.Json(build_root_cause(job, jid)),
                         job.get("confidence"),
                         job.get("catalog_item"),
                         job.get("job_duration_seconds"),
