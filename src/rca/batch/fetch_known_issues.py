@@ -26,7 +26,8 @@ def fetch_known_issues(
             psycopg2.sql.SQL(
                 """SELECT * FROM (
                        SELECT DISTINCT ON (root_cause_category, catalog_item)
-                              id, catalog_item, root_cause_category, root_cause_summary,
+                              id, catalog_item, root_cause_category,
+                              root_cause->>'summary' AS root_cause_summary,
                               batch_id, confidence, cross_job_pattern,
                               COUNT(*) OVER (
                                   PARTITION BY root_cause_category, catalog_item

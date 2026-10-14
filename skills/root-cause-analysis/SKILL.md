@@ -193,8 +193,12 @@ python scripts/cli.py upload --job-id <job-id>
      - **Configs**: From `step4.github_fetches[].fetched_configs.{purpose}.path` → construct as `{config_owner}/{config_repo}:{path}` (e.g., `example-org/config-repo:platform/account.yaml`)
      - **Workloads**: From `step4.github_fetches[].location.parsed` → construct as `{owner}/{repo}:{file_path}:{line_number}` (e.g., `example-org/workload-repo:roles/example-role/tasks/main.yml:42`)
 3. **Correlation**: How AAP logs link to Splunk (GUID, namespace, timestamps, pod names)
-4. **Recommendations**: Specific file changes with paths, actions, and reasons
+4. **Causal Chain**: The ordered account of how the failure unfolded. For each step, state the `relationship` (`direct_cause` or `contributing_factor`), a one-sentence `statement`, and `evidence_ref` (the 0-based index into `evidence[]` that supports it). Include at least the direct cause(s); add contributing factors when they materially shaped the failure.
+5. **Misidentifications**: Theories you genuinely suspected and then ruled out while investigating — not a checklist of everything you looked at. For each, give `theory`, `why_suspected`, `why_ruled_out`, and the `evidence_ref` that ruled it out. Leave this array empty if nothing was ruled out.
+6. **Recommendations**: Specific file changes with paths, actions, and reasons
    - **Include `github_path`** in recommendations when referencing GitHub files (format: `owner/repo:path/to/file.yml:line`)
+   - **Include `evidence_ref`** pointing at the evidence entry the recommendation addresses
+   - **Optionally include `fix`** when you can state the exact change as a unified diff against a file you already fetched in step4: `{"status": "proposed", "base_sha": "<the fetched file's sha from step4_github_fetch_history.json>", "diff": "<unified diff>", "pr_link": null}`. `status` is always `"proposed"` — this is a model-authored, untested suggestion, not a verified fix. Never set `fix` without both `status` and `base_sha`; set it to `null` (or omit it) when you don't have a concrete patch.
 
 **Note**: Job details, failed tasks, and configuration data are available in step1 and step4 files - reference them rather than duplicating in the summary.
 
@@ -245,18 +249,36 @@ See `schemas/summary.schema.json` for complete structure. Example:
       "github_path": "example-org/workload-repo:roles/example-role/tasks/main.yml:42"
     }
   ],
+  "causal_chain": [
+    {
+      "step": 1,
+      "relationship": "direct_cause",
+      "statement": "The environment config is missing 'aws_access_key_id', so the task that references it failed",
+      "evidence_ref": 1
+    },
+    {
+      "step": 2,
+      "relationship": "contributing_factor",
+      "statement": "The role has no default or validation for this variable, so the failure only surfaces at task runtime",
+      "evidence_ref": 2
+    }
+  ],
+  "misidentifications": [],
   "recommendations": [
     {
       "priority": "high",
       "action": "Add missing variable",
-      "file": "platform/account.yaml",
       "github_path": "example-org/config-repo:platform/account.yaml",
-      "github_url": "https://github.com/example-org/config-repo/blob/main/platform/account.yaml",
-      "change": "Add aws_access_key_id variable",
-      "details": "Variable is referenced but not defined"
+      "details": "Variable is referenced but not defined",
+      "evidence_ref": 1,
+      "fix": {
+        "status": "proposed",
+        "base_sha": "<sha from step4 fetched_configs entry for this file>",
+        "diff": "--- a/platform/account.yaml\n+++ b/platform/account.yaml\n@@ -10,6 +10,7 @@\n common:\n+  aws_access_key_id: \"{{ vault_aws_access_key_id }}\"\n",
+        "pr_link": null
+      }
     }
-  ],
-  "contributing_factors": ["Missing variable definition", "Incomplete configuration"]
+  ]
 }
 ```
 
