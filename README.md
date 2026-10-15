@@ -13,10 +13,10 @@ flowchart TD
     Runner --> Query[Query unprocessed jobs from PostgreSQL]
     Query --> AnyJobs{Jobs found?}
     AnyJobs -- No --> Done([Exit successfully])
-    AnyJobs -- Yes --> Dedup[Intra-batch dedup]
-    Dedup --> Known[Load recent high-confidence issues]
+    AnyJobs -- Yes --> Gate[Unified pre-analysis gate]
+    Gate --> Known[Load recent high-confidence issues]
     Known --> Filter{Known-issue pre-filter enabled?}
-    Filter -- Yes --> Prefilter[Match by catalog and error similarity]
+    Filter -- Yes --> Prefilter[Cluster duplicates and match by shared scorer]
     Filter -- No --> Analysis
     Prefilter --> Matched[Store pre-matched jobs]
     Prefilter --> Analysis[Bounded parallel Python analysis]
@@ -33,7 +33,7 @@ flowchart TD
     Upload --> Aggregate[Semantic aggregation: historical matches and cross-job patterns]
     Known --> Aggregate
     Aggregate --> Write[Write report JSON]
-    Write --> Store[Store results, derive pattern IDs, and link duplicates]
+    Write --> Store[Store one result per analyzed job and link canonical patterns]
     Store --> Jira[Step 6 placeholder: no Jira tickets created]
     Jira --> Done
 ```
@@ -188,13 +188,15 @@ Batch reports are written to
 }
 ```
 
-`pattern_id` is a durable, derived anchor. It is the earliest known result ID
-linked to the failure pattern, or the first persisted result ID for a new
-current-batch pattern. The anchor is stored in the existing
-`cross_job_pattern` column, so this feature does not add a database table or
-column. `historical_matches` and `cross_job_patterns` remain separate report
-signals, but they now share the same `pattern_id` when they describe the same
-failure pattern.
+`pattern_id` is a report signal representing the canonical result ID for a
+linked issue cluster. The durable relationship is stored in
+`related_result_id`, with `related_result_confidence` annotating the link. The
+anchor row has a null `related_result_id`; every other cluster member points
+directly to that anchor.
+`historical_matches` and `cross_job_patterns` remain report signals, but the
+durable grouping is the canonical `related_result_id` anchor. Every analyzed
+job gets its own result row. A cluster can therefore be read with a single
+equality query on `related_result_id` and does not require recursion.
 
 Per-job analysis files are saved under `$RCA_STATE_DIR/.analysis/{job_id}/`:
 job context, Splunk logs, the correlation timeline, GitHub fetch history, and

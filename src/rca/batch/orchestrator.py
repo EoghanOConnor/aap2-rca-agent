@@ -27,15 +27,17 @@ from psycopg2.pool import ThreadedConnectionPool
 from rca.analysis.jumpbox_io import upload_to_jumpbox
 from rca.analysis.pipeline import AnalysisArtifacts, run_analysis
 from rca.batch.fetch_known_issues import fetch_known_issues
+from rca.batch.match import MatchSignals, score_similarity
 from rca.batch.pre_filter_jobs import (
-    dedup_batch,
     fetch_job_metadata,
-    filter_against_known_issues,
+    fetch_recent_results,
+    pre_matched_entries,
+    pre_analysis_gate,
 )
 from rca.batch.query_source_db import query_job_ids
 from rca.batch.store_report import (
     link_intra_batch_dupes,
-    store_cross_patterns,
+    post_analysis_link,
     store_pre_matched,
     store_report,
 )
@@ -672,7 +674,7 @@ def _normalize_semantics(
                 for match in matches_by_job.get(job_id, [])
             }
             if pattern_ids:
-                item["pattern_id"] = min(pattern_ids)
+                item["pattern_id"] = _min_pattern_id(pattern_ids)
                 if len(pattern_ids) > 1:
                     item["confidence"] = "low"
             shared_path = pattern.get("shared_github_path")
@@ -716,6 +718,98 @@ async def _aggregate_semantics(
 def _confidence(value: Any) -> str:
     candidate = str(value or "").lower()
     return candidate if candidate in _VALID_CONFIDENCE else "low"
+
+
+def _min_pattern_id(pattern_ids: set[str]) -> str:
+    """Pick the canonical pattern_id, numerically where possible.
+
+    pattern_id is usually a numeric result id as a string (fetch_known_issues),
+    but tests also exercise opaque non-numeric identifiers, so fall back to a
+    plain string min rather than assuming every value parses as an int.
+    """
+    try:
+        return str(min(int(pattern_id) for pattern_id in pattern_ids))
+    except (TypeError, ValueError):
+        return min(pattern_ids)
+
+
+def _deterministic_historical_matches(
+    job_summaries: list[dict[str, Any]], known_issues: list[dict[str, Any]]
+) -> None:
+    """Match jobs against known issues using match.py's shared scorer.
+
+    Only an unambiguous "high" confidence result counts: this path has no
+    semantic judgment behind it, so unlike post_analysis_link it never
+    accepts a medium/low-confidence deterministic match.
+    """
+
+    for summary in job_summaries:
+        if summary.get("status") != "analyzed":
+            continue
+
+        category = summary.get("root_cause_category")
+        catalog_item = summary.get("catalog_item")
+        summary_text = summary.get("root_cause_summary")
+        best_issue: dict[str, Any] | None = None
+        best_similarity = 0.0
+
+        for issue in known_issues:
+            if category is None or catalog_item is None:
+                break
+            if issue.get("root_cause_category") != category:
+                continue
+            if issue.get("catalog_item") != catalog_item:
+                continue
+
+            score = score_similarity(
+                MatchSignals(catalog_item=catalog_item, text=summary_text, category=category),
+                MatchSignals(
+                    catalog_item=issue.get("catalog_item"),
+                    text=issue.get("root_cause_summary"),
+                    category=issue.get("root_cause_category"),
+                ),
+                "post_analysis",
+            )
+            if score.confidence != "high" or score.score < best_similarity:
+                continue
+
+            best_issue = issue
+            best_similarity = score.score
+
+        if best_issue is None:
+            summary["historical_matches"] = []
+            continue
+
+        try:
+            result_id = int(best_issue["result_id"])
+            recurrence_count = max(1, int(best_issue.get("recurrence_count", 1)))
+        except (KeyError, TypeError, ValueError):
+            summary["historical_matches"] = []
+            continue
+        summary["historical_matches"] = [
+            {
+                "matched_result_id": result_id,
+                "recurrence_count": recurrence_count,
+                "similarity_reasoning": (
+                    f"Deterministic root-cause summary similarity is {best_similarity:.0%}."
+                ),
+                "pattern_id": str(best_issue.get("pattern_id") or result_id),
+                "confidence": "high",
+                # Not derived from the LLM's structured output (_normalize_semantics
+                # builds its match dicts from a fixed set of keys that excludes this
+                # one), so post_analysis_link can trust it to gate strict re-validation.
+                "match_source": "deterministic_fallback",
+                "evidence": [
+                    {
+                        "statement_type": "observed",
+                        "description": (
+                            f"The root-cause summaries are {best_similarity:.0%} similar."
+                        ),
+                        "source": "deterministic_fallback",
+                    }
+                ],
+            }
+        ]
 
 
 def _category(value: Any) -> str:
@@ -1071,17 +1165,64 @@ def _store_batch_report(
     dupes: list[dict[str, Any]],
 ) -> bool:
     with pooled_connection(pool) as conn:
-        stored = store_report(conn, database, report, filename=str(report_path))
+        stored = store_report(
+            conn, database, report, filename=str(report_path), commit=False
+        )
         if not stored:
             return False
-        store_cross_patterns(conn, database, report)
-    if dupes:
-        try:
-            with pooled_connection(pool) as conn:
-                link_intra_batch_dupes(conn, database, dupes)
-        except psycopg2.Error as exc:
-            logger.warning("Could not link intra-batch duplicate jobs: %s", exc)
+        post_analysis_link(conn, database, report, commit=False)
+        if dupes:
+            link_intra_batch_dupes(conn, database, dupes, commit=False)
+        conn.commit()
     return True
+
+
+def _recover_failed_representatives(
+    executions: list[JobExecution],
+    dupes: list[dict[str, Any]],
+    skipped_job_ids: set[int],
+    config: Config,
+    pool: Any,
+    *,
+    cwd: Path,
+) -> tuple[list[JobExecution], list[dict[str, Any]]]:
+    """Analyze another duplicate when its representative fails."""
+
+    failed_representatives = {
+        execution.job_id for execution in executions if execution.status != "completed"
+    }
+    if not failed_representatives or not dupes:
+        return executions, dupes
+
+    candidates_by_representative: dict[str, list[int]] = defaultdict(list)
+    for entry in dupes:
+        representative = str(entry["representative_job_id"])
+        candidate = int(entry["job_id"])
+        if representative in failed_representatives and candidate not in skipped_job_ids:
+            candidates_by_representative[representative].append(candidate)
+
+    for representative, candidates in candidates_by_representative.items():
+        candidates.sort()
+        for candidate in candidates:
+            logger.warning(
+                "Representative job %s failed; retrying duplicate job %s",
+                representative,
+                candidate,
+            )
+            recovered = asyncio.run(
+                _analyze_jobs([candidate], config, pool, cwd=cwd)
+            )
+            executions.extend(recovered)
+            if recovered and recovered[0].status == "completed":
+                for entry in dupes:
+                    if str(entry["representative_job_id"]) == representative:
+                        entry["representative_job_id"] = candidate
+                dupes = [
+                    entry for entry in dupes if int(entry["job_id"]) != candidate
+                ]
+                break
+
+    return executions, dupes
 
 
 def _run_agent_batch(
@@ -1096,6 +1237,7 @@ def _run_agent_batch(
     ]
     report_summaries = [_job_summary(execution) for execution in executions]
     semaphore = asyncio.Semaphore(config.max_parallel_jobs)
+    semantic_aggregation_failed = False
     try:
         cross_patterns, aggregation_result = asyncio.run(
             _aggregate_semantics(
@@ -1107,15 +1249,27 @@ def _run_agent_batch(
             )
         )
     except Exception as exc:
-        logger.warning("Semantic batch aggregation failed; using deterministic report only: %s", exc)
+        semantic_aggregation_failed = True
+        logger.warning(
+            "Semantic batch aggregation failed; using deterministic historical matching: %s",
+            exc,
+        )
         cross_patterns = []
         aggregation_result = None
+
+    if semantic_aggregation_failed:
+        _deterministic_historical_matches(successful_summaries, known_issues)
+    else:
         for summary in successful_summaries:
-            summary["historical_matches"] = []
+            if not summary.get("historical_matches"):
+                _deterministic_historical_matches([summary], known_issues)
 
     # Reuse the semantic matches on the report copies. The successful summaries
     # were normalized in place by _aggregate_semantics.
-    matches = {item["job_id"]: item.get("historical_matches", []) for item in successful_summaries}
+    matches = {
+        item["job_id"]: item.get("historical_matches", [])
+        for item in successful_summaries
+    }
     for summary in report_summaries:
         summary["historical_matches"] = matches.get(summary["job_id"], [])
     return report_summaries, cross_patterns, aggregation_result
@@ -1166,14 +1320,39 @@ def run_batch(
             return 0
 
         logger.info("Found %d job(s): %s", len(job_ids), ", ".join(map(str, job_ids)))
-        logger.info("[STEP 1a] Deduplicating within batch")
+        logger.info("[STEP 1a] Running unified pre-analysis gate")
         try:
             with pooled_connection(pool) as conn:
                 metadata = fetch_job_metadata(conn, database["source_table"], job_ids)
-            representative_ids, dupes = dedup_batch(job_ids, metadata)
         except psycopg2.Error as exc:
-            logger.warning("Could not deduplicate jobs; analyzing all queried IDs: %s", exc)
-            representative_ids, dupes = list(job_ids), []
+            logger.warning("Could not load job metadata; analyzing all queried IDs: %s", exc)
+            metadata = {}
+
+        recent_results: list[dict[str, Any]] = []
+        if no_pre_filter:
+            logger.info("[STEP 1b] Historical pre-filter disabled (--no-pre-filter)")
+        else:
+            try:
+                with pooled_connection(pool) as conn:
+                    recent_results = fetch_recent_results(
+                        conn,
+                        database["results_table"],
+                        database["source_table"],
+                        lookback_hours=DEFAULT_LOOKBACK_HOURS,
+                    )
+            except psycopg2.Error as exc:
+                logger.warning("Could not load pre-filter history; continuing with dedup only: %s", exc)
+
+        try:
+            analyze_ids, skip_targets, dupes = pre_analysis_gate(
+                job_ids,
+                metadata,
+                recent_results,
+                use_history=not no_pre_filter,
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning("Pre-analysis gate failed; analyzing all jobs: %s", exc)
+            analyze_ids, skip_targets, dupes = list(job_ids), {}, []
 
         known_issues: list[dict[str, Any]] = []
         try:
@@ -1187,47 +1366,45 @@ def run_batch(
         except psycopg2.Error as exc:
             logger.warning("Could not load recent known issues; continuing without them: %s", exc)
 
-        analyze_ids = list(representative_ids)
         pre_matched: list[dict[str, Any]] = []
-        if no_pre_filter:
-            logger.info("[STEP 1b] Pre-filter disabled (--no-pre-filter)")
+        if skip_targets:
+            pre_matched = pre_matched_entries(
+                skip_targets,
+                recent_results,
+                job_ids,
+            )
+            logger.info(
+                "[STEP 1b] Pre-analysis gate matched %d job(s); %d job(s) require analysis",
+                len(pre_matched),
+                len(analyze_ids),
+            )
         elif known_issues:
             logger.info(
-                "[STEP 1b] Pre-filtering %d job(s) against %d known issue(s)",
-                len(representative_ids),
+                "[STEP 1b] Pre-analysis gate matched 0 job(s); %d job(s) require analysis",
+                len(analyze_ids),
+            )
+            logger.debug(
+                "Loaded %d known issue(s) for post-analysis semantic matching",
                 len(known_issues),
             )
-            try:
-                with pooled_connection(pool) as conn:
-                    filter_result = filter_against_known_issues(
-                        conn,
-                        database["results_table"],
-                        database["source_table"],
-                        representative_ids,
-                        lookback_hours=DEFAULT_LOOKBACK_HOURS,
-                    )
-                analyze_ids = filter_result["analyze"]
-                pre_matched = filter_result["pre_matched"]
-            except psycopg2.Error as exc:
-                logger.warning("Pre-filter failed; analyzing unmatched jobs normally: %s", exc)
 
         if pre_matched:
             logger.info("Pre-filter matched %d job(s)", len(pre_matched))
             try:
                 with pooled_connection(pool) as conn:
-                    store_pre_matched(conn, database, pre_matched)
+                    store_pre_matched(conn, database, pre_matched, commit=False)
+                    if not analyze_ids and dupes:
+                        link_intra_batch_dupes(conn, database, dupes, commit=False)
+                    conn.commit()
             except psycopg2.Error as exc:
                 logger.error("Failed to store pre-matched jobs: %s", exc)
                 return 1
 
         if not analyze_ids:
+            # Every cluster representative was skip-matched, so skip_targets (and
+            # therefore pre_matched) is non-empty, and dupes were already linked
+            # above alongside pre_matched. There's nothing left to link here.
             logger.info("No jobs require full RCA")
-            if dupes:
-                try:
-                    with pooled_connection(pool) as conn:
-                        link_intra_batch_dupes(conn, database, dupes)
-                except psycopg2.Error as exc:
-                    logger.warning("Could not link intra-batch duplicates: %s", exc)
             prepare_jira_tickets({"batch_id": batch_id, "job_summaries": []})
             logger.info("[SUCCESS] Batch RCA completed")
             return 0
@@ -1235,6 +1412,14 @@ def run_batch(
         logger.info("[STEP 2] Running deterministic analysis and Skill-based RCA for %d job(s)", len(analyze_ids))
         agent_spawn = _utc_now().isoformat().replace("+00:00", "Z")
         executions = asyncio.run(_analyze_jobs(analyze_ids, config, pool, cwd=working_dir))
+        executions, dupes = _recover_failed_representatives(
+            executions,
+            dupes,
+            set(skip_targets),
+            config,
+            pool,
+            cwd=working_dir,
+        )
         report_summaries, cross_patterns, aggregation_result = _run_agent_batch(
             executions,
             known_issues,

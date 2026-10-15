@@ -384,14 +384,30 @@ def test_batch_exit_status_preserves_reports_and_partial_success(
         for index, status in enumerate(statuses)
     ]
     pre_matched = [{"job_id": 103, "matched_result_id": 9}] if has_pre_match else []
-    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(object()))
+    skip_targets = {103: 9} if has_pre_match else {}
+    recent_results = [
+        {
+            "id": 9,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "root_cause_summary": "Known issue",
+        }
+    ]
+    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
     monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[101, 102, 103]))
     monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value={}))
     monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[{"result_id": 9}]))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=recent_results))
     monkeypatch.setattr(
         orchestrator,
-        "filter_against_known_issues",
-        Mock(return_value={"analyze": [int(item.job_id) for item in executions], "pre_matched": pre_matched}),
+        "pre_analysis_gate",
+        Mock(
+            return_value=(
+                [int(item.job_id) for item in executions],
+                skip_targets,
+                [],
+            )
+        ),
     )
     monkeypatch.setattr(orchestrator, "store_pre_matched", Mock())
     monkeypatch.setattr(orchestrator, "_analyze_jobs", AsyncMock(return_value=executions))
@@ -409,6 +425,103 @@ def test_batch_exit_status_preserves_reports_and_partial_success(
         assert store.call_args.args[3].is_file()
     else:
         store.assert_not_called()
+
+
+def test_failed_representative_falls_back_to_next_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    executions = [
+        orchestrator.JobExecution(
+            "100",
+            "failed",
+            1,
+            error="analysis failed",
+        )
+    ]
+    recovered = [
+        orchestrator.JobExecution(
+            "101",
+            "completed",
+            1,
+            summary={"root_cause": {"summary": "recovered"}},
+        )
+    ]
+    dupes = [
+        {"job_id": 101, "representative_job_id": 100},
+        {"job_id": 102, "representative_job_id": 100},
+    ]
+    monkeypatch.setattr(
+        orchestrator,
+        "_analyze_jobs",
+        AsyncMock(return_value=recovered),
+    )
+
+    executions, updated_dupes = orchestrator._recover_failed_representatives(
+        executions,
+        dupes,
+        set(),
+        config,
+        object(),
+        cwd=tmp_path,
+    )
+
+    assert [execution.job_id for execution in executions] == ["100", "101"]
+    assert executions[-1].job_id == "101"
+    assert updated_dupes == [{"job_id": 102, "representative_job_id": 101}]
+
+
+def test_store_batch_report_links_in_one_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = Mock()
+    pool = SimpleNamespace(getconn=Mock(return_value=connection), putconn=Mock())
+    store = Mock(return_value=True)
+    post_link = Mock()
+    link_dupes = Mock()
+    monkeypatch.setattr(orchestrator, "store_report", store)
+    monkeypatch.setattr(orchestrator, "post_analysis_link", post_link)
+    monkeypatch.setattr(orchestrator, "link_intra_batch_dupes", link_dupes)
+    report = {"job_summaries": []}
+    dupes = [{"job_id": 102, "representative_job_id": 101}]
+
+    assert orchestrator._store_batch_report(pool, {}, report, Path("report.json"), dupes)
+
+    store.assert_called_once_with(
+        connection,
+        {},
+        report,
+        filename="report.json",
+        commit=False,
+    )
+    post_link.assert_called_once_with(connection, {}, report, commit=False)
+    link_dupes.assert_called_once_with(connection, {}, dupes, commit=False)
+    connection.commit.assert_called_once_with()
+
+
+def test_store_batch_report_rolls_back_when_linking_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = Mock()
+    connection.closed = False
+    pool = SimpleNamespace(getconn=Mock(return_value=connection), putconn=Mock())
+    monkeypatch.setattr(orchestrator, "store_report", Mock(return_value=True))
+    monkeypatch.setattr(
+        orchestrator,
+        "post_analysis_link",
+        Mock(side_effect=OSError("link failed")),
+    )
+
+    with pytest.raises(OSError, match="link failed"):
+        orchestrator._store_batch_report(
+            pool,
+            {},
+            {"job_summaries": []},
+            Path("report.json"),
+            [],
+        )
+
+    connection.commit.assert_not_called()
+    connection.rollback.assert_called_once_with()
 
 
 def test_normalize_semantics_validates_job_and_result_ids() -> None:
@@ -575,6 +688,55 @@ def test_normalize_semantics_marks_ambiguous_pattern_low() -> None:
     assert cross_pattern["confidence"] == "low"
 
 
+def test_normalize_semantics_picks_numeric_min_pattern_id() -> None:
+    # Real pattern_ids (fetch_known_issues) are numeric result ids as strings;
+    # a lexicographic min would wrongly pick "100" over "9" here.
+    summaries = [
+        {"job_id": "job-1", "status": "analyzed", "confidence": "high"},
+        {"job_id": "job-2", "status": "analyzed", "confidence": "high"},
+    ]
+    known_issues = [
+        {"result_id": 9, "recurrence_count": 1, "pattern_id": "9"},
+        {"result_id": 100, "recurrence_count": 1, "pattern_id": "100"},
+    ]
+    output = {
+        "historical_matches": [
+            {
+                "job_id": "job-1",
+                "matches": [
+                    {
+                        "matched_result_id": 9,
+                        "similarity_reasoning": "Same failure mode.",
+                        "confidence": "high",
+                    }
+                ],
+            },
+            {
+                "job_id": "job-2",
+                "matches": [
+                    {
+                        "matched_result_id": 100,
+                        "similarity_reasoning": "Same failure mode.",
+                        "confidence": "high",
+                    }
+                ],
+            },
+        ],
+        "cross_job_patterns": [
+            {
+                "pattern": "ambiguous failure",
+                "jobs": ["job-1", "job-2"],
+                "description": "The jobs share a failure mode.",
+                "confidence": "high",
+            }
+        ],
+    }
+
+    normalized = orchestrator._normalize_semantics(output, summaries, known_issues)
+
+    assert normalized["cross_job_patterns"][0]["pattern_id"] == "9"
+
+
 def test_aggregate_semantics_uses_packaged_output_schema(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -615,6 +777,136 @@ def test_aggregate_semantics_uses_packaged_output_schema(
         "type": "json_schema",
         "schema": expected_schema,
     }
+
+
+def test_semantic_failure_falls_back_to_deterministic_matching(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    artifacts = AnalysisArtifacts(
+        job_id="201",
+        analysis_dir=tmp_path / "201",
+        job_context={"job_name": "RHPDS a.widget.dev-201-create"},
+        splunk_logs={},
+        correlation={},
+        github_fetch_history={},
+    )
+    execution = orchestrator.JobExecution(
+        job_id="201",
+        status="completed",
+        duration_ms=100,
+        artifacts=artifacts,
+        summary={
+            "catalog_item": "widget",
+            "root_cause": {
+                "summary": "Worker 7 timed out.",
+                "category": "infrastructure",
+                "confidence": "high",
+            },
+        },
+    )
+    known_issue = {
+        "result_id": 9,
+        "catalog_item": "widget",
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker 7 timed out.",
+        "recurrence_count": 2,
+        "pattern_id": "9",
+    }
+    monkeypatch.setattr(
+        orchestrator,
+        "_aggregate_semantics",
+        AsyncMock(side_effect=RuntimeError("semantic unavailable")),
+    )
+
+    summaries, cross_patterns, aggregation_result = orchestrator._run_agent_batch(
+        [execution], [known_issue], _config(tmp_path), cwd=tmp_path
+    )
+
+    assert cross_patterns == []
+    assert aggregation_result is None
+    assert summaries[0]["historical_matches"] == [
+        {
+            "matched_result_id": 9,
+            "recurrence_count": 2,
+            "similarity_reasoning": "Deterministic root-cause summary similarity is 100%.",
+            "pattern_id": "9",
+            "confidence": "high",
+            "match_source": "deterministic_fallback",
+            "evidence": [
+                {
+                    "statement_type": "observed",
+                    "description": "The root-cause summaries are 100% similar.",
+                    "source": "deterministic_fallback",
+                }
+            ],
+        }
+    ]
+
+
+def test_deterministic_historical_matches_tolerates_malformed_known_issue() -> None:
+    summary = {
+        "job_id": "201",
+        "status": "analyzed",
+        "catalog_item": "widget",
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker 7 timed out.",
+    }
+    malformed_known_issue = {
+        "result_id": "not-an-int",
+        "catalog_item": "widget",
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker 7 timed out.",
+    }
+
+    orchestrator._deterministic_historical_matches([summary], [malformed_known_issue])
+
+    assert summary["historical_matches"] == []
+
+
+def test_empty_semantic_match_falls_back_to_deterministic_matching(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    artifacts = AnalysisArtifacts(
+        job_id="201",
+        analysis_dir=tmp_path / "201",
+        job_context={"job_name": "RHPDS a.widget.dev-201-create"},
+        splunk_logs={},
+        correlation={},
+        github_fetch_history={},
+    )
+    execution = orchestrator.JobExecution(
+        job_id="201",
+        status="completed",
+        duration_ms=100,
+        artifacts=artifacts,
+        summary={
+            "catalog_item": "widget",
+            "root_cause": {
+                "summary": "Worker 7 timed out.",
+                "category": "infrastructure",
+                "confidence": "high",
+            },
+        },
+    )
+    known_issue = {
+        "result_id": 9,
+        "catalog_item": "widget",
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker 7 timed out.",
+    }
+    monkeypatch.setattr(
+        orchestrator,
+        "_aggregate_semantics",
+        AsyncMock(return_value=([], None)),
+    )
+
+    summaries, cross_patterns, aggregation_result = orchestrator._run_agent_batch(
+        [execution], [known_issue], _config(tmp_path), cwd=tmp_path
+    )
+
+    assert cross_patterns == []
+    assert aggregation_result is None
+    assert summaries[0]["historical_matches"][0]["matched_result_id"] == 9
 
 
 def test_report_aggregation_is_deterministic(tmp_path: Path) -> None:

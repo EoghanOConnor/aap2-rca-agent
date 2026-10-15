@@ -31,13 +31,17 @@ CREATE TABLE {RESULTS_TABLE} (
     catalog_item TEXT,
     root_cause_category TEXT,
     root_cause JSONB,
+    related_result_id INTEGER REFERENCES aap2_job_results(id),
+    related_result_confidence TEXT
+        CHECK (related_result_confidence IN ('high', 'medium', 'low')),
     job_duration_seconds INTEGER,
-    cross_job_pattern TEXT,
-    cross_job_pattern_description TEXT,
     ticket_link TEXT,
     ticket_resolve_datetime_gmt TIMESTAMPTZ,
     UNIQUE (batch_id, job_id)
 );
+
+CREATE INDEX aap2_job_results_related_result_id_idx
+    ON aap2_job_results(related_result_id);
 """
 
 

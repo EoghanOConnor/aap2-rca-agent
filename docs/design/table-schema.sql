@@ -19,10 +19,10 @@ CREATE TABLE aap2_job_results (
     --   evidence[], causal_chain[], misidentifications[], recommendations[] }
     root_cause                     JSONB,
 
-    -- Same-batch grouping signal, written by store_cross_patterns().
-    -- Unconfirmed: rendered as "possibly related", never as a verified match.
-    cross_job_pattern              TEXT,
-    cross_job_pattern_description  TEXT,
+    -- Relationship to the canonical result row for the same issue cluster.
+    -- The anchor row is NULL; every other member points directly to it.
+    related_result_id              INTEGER REFERENCES aap2_job_results(id),
+    related_result_confidence      TEXT,
 
     -- ticket_key is the short Jira key (RHDP-1234); the MCP tools take a key,
     -- not a URL. ticket_resolve_datetime_gmt drives the known-issue
@@ -37,6 +37,12 @@ CREATE TABLE aap2_job_results (
     UNIQUE (batch_id, job_id)
 );
 
+-- post_analysis_link's _resolved_anchors/_assign_clusters walk and lock
+-- clusters via `WHERE related_result_id = ANY(%s) FOR UPDATE`; without this
+-- index that's a sequential scan under a row lock on every batch.
+CREATE INDEX aap2_job_results_related_result_id_idx
+    ON aap2_job_results(related_result_id);
+
 
 -- Changes from what the code uses today:
 --
@@ -46,8 +52,8 @@ CREATE TABLE aap2_job_results (
 --   created_at                     NEW  removes parsing timestamps out of batch_id
 --   UNIQUE (batch_id, job_id)      NEW  constraint the ON CONFLICT assumes exists
 --
---   cross_job_pattern              unchanged
---   cross_job_pattern_description  unchanged
+--   cross_job_pattern              -> related_result_id
+--   cross_job_pattern_description  -> removed (confidence annotates the link)
 --
 -- Not added: cross_job_pattern_github_path. A shared offending file is just a
 -- 'related_job' evidence entry's github_path.
@@ -61,7 +67,14 @@ CREATE TABLE aap2_job_results (
 --
 -- ALTER TABLE aap2_job_results ADD COLUMN IF NOT EXISTS root_cause JSONB;
 -- ALTER TABLE aap2_job_results
+--     ADD COLUMN IF NOT EXISTS related_result_id
+--         INTEGER REFERENCES aap2_job_results(id);
+-- ALTER TABLE aap2_job_results
+--     ADD COLUMN IF NOT EXISTS related_result_confidence TEXT;
+-- ALTER TABLE aap2_job_results
 --     ADD CONSTRAINT aap2_job_results_batch_id_job_id_key UNIQUE (batch_id, job_id);
+-- CREATE INDEX IF NOT EXISTS aap2_job_results_related_result_id_idx
+--     ON aap2_job_results(related_result_id);
 --
 -- Backfill required: existing rows have root_cause_summary but no
 -- root_cause JSONB. Every query that now reads root_cause->>'summary'

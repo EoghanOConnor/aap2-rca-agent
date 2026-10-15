@@ -3,8 +3,6 @@
 import json
 from unittest.mock import MagicMock
 
-from psycopg2 import sql
-
 from rca.batch import store_report
 
 
@@ -17,38 +15,7 @@ def _connection_and_cursor():
     return connection, cursor
 
 
-def test_find_match_accepts_mapping_rows(monkeypatch) -> None:
-    monkeypatch.setattr(
-        store_report,
-        "known_issue_active_sql",
-        lambda _conn, *, table: sql.SQL("TRUE"),
-    )
-    cursor = MagicMock()
-    cursor.connection = MagicMock()
-    cursor.fetchall.return_value = [
-        {"id": 42, "root_cause_summary": "A worker ran out of capacity"}
-    ]
-
-    match_id = store_report.find_match(
-        cursor,
-        "results",
-        {
-            "job_id": "123",
-            "root_cause_category": "infrastructure",
-            "catalog_item": "widget",
-            "root_cause_summary": "A worker ran out of capacity",
-        },
-    )
-
-    assert match_id == 42
-
-
-def test_store_report_reads_mapping_insert_result(monkeypatch) -> None:
-    monkeypatch.setattr(
-        store_report,
-        "known_issue_active_sql",
-        lambda _conn, *, table: sql.SQL("TRUE"),
-    )
+def test_store_report_reads_mapping_insert_result() -> None:
     connection, cursor = _connection_and_cursor()
     cursor.fetchall.return_value = []
     cursor.fetchone.return_value = {"id": 55}
@@ -66,12 +33,20 @@ def test_store_report_reads_mapping_insert_result(monkeypatch) -> None:
                     "root_cause_summary": "A worker ran out of capacity",
                     "confidence": "high",
                     "catalog_item": "widget",
+                    "historical_matches": [
+                        {
+                            "matched_result_id": 99,
+                            "similarity_reasoning": "Same worker capacity issue.",
+                            "confidence": "high",
+                        }
+                    ],
                 }
             ],
         },
     )
 
     assert (55, "123") in [call.args[1] for call in cursor.execute.call_args_list]
+    assert (99, "123") not in [call.args[1] for call in cursor.execute.call_args_list]
     connection.commit.assert_called_once_with()
 
 
@@ -90,12 +65,7 @@ def test_link_intra_batch_dupes_reads_mapping_result_row() -> None:
     connection.commit.assert_called_once_with()
 
 
-def test_store_report_assigns_pattern_id_from_result_ids(monkeypatch) -> None:
-    monkeypatch.setattr(
-        store_report,
-        "known_issue_active_sql",
-        lambda _conn, *, table: sql.SQL("TRUE"),
-    )
+def test_store_report_assigns_pattern_id_from_result_ids() -> None:
     connection, cursor = _connection_and_cursor()
     cursor.fetchall.return_value = []
     cursor.fetchone.side_effect = [{"id": 12}, {"id": 11}]
@@ -127,13 +97,32 @@ def test_store_report_assigns_pattern_id_from_result_ids(monkeypatch) -> None:
     connection.commit.assert_called_once_with()
 
 
-def test_store_cross_patterns_persists_derived_pattern_id() -> None:
+def test_post_analysis_link_clears_a_stale_fallback_pattern_id_on_rejection() -> None:
+    # store_report() stamps a fallback pattern_id = min(result_ids) onto any
+    # pattern lacking one before post_analysis_link validates it. If validation
+    # then rejects the pattern (here: incompatible root_cause_category), that
+    # fallback must not survive and misrepresent an unlinked pattern as linked.
     connection, cursor = _connection_and_cursor()
+    cursor.fetchall.return_value = []
     report = {
         "batch_id": "batch_test",
         "job_summaries": [
-            {"job_id": "123", "status": "analyzed", "result_id": 42},
-            {"job_id": "124", "status": "analyzed", "result_id": 43},
+            {
+                "job_id": "123",
+                "status": "analyzed",
+                "result_id": 42,
+                "catalog_item": "widget",
+                "root_cause_category": "infrastructure",
+                "root_cause_summary": "Worker 7 timed out.",
+            },
+            {
+                "job_id": "124",
+                "status": "analyzed",
+                "result_id": 43,
+                "catalog_item": "widget",
+                "root_cause_category": "application_bug",
+                "root_cause_summary": "Worker 7 timed out.",
+            },
         ],
         "cross_job_patterns": [
             {
@@ -146,11 +135,79 @@ def test_store_cross_patterns_persists_derived_pattern_id() -> None:
         ],
     }
 
-    store_report.store_cross_patterns(connection, {"results_table": "results"}, report)
+    store_report.post_analysis_link(
+        connection, {"results_table": "results", "source_table": "events"}, report
+    )
 
-    execute_params = [call.args[1] for call in cursor.execute.call_args_list]
-    assert ("42", "Both jobs time out in worker 7.", 42) in execute_params
-    assert ("42", "Both jobs time out in worker 7.", 43) in execute_params
+    assert "pattern_id" not in report["cross_job_patterns"][0]
+
+
+def test_post_analysis_link_persists_derived_pattern_id() -> None:
+    connection, cursor = _connection_and_cursor()
+    result_rows = [
+        {
+            "id": 42,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "root_cause_summary": "Worker 7 timed out.",
+            "related_result_id": None,
+            "related_result_confidence": None,
+        },
+        {
+            "id": 43,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "root_cause_summary": "Worker 7 timed out.",
+            "related_result_id": None,
+            "related_result_confidence": None,
+        },
+    ]
+    cursor.fetchall.side_effect = [result_rows, result_rows]
+    report = {
+        "batch_id": "batch_test",
+        "job_summaries": [
+            {
+                "job_id": "123",
+                "status": "analyzed",
+                "result_id": 42,
+                "catalog_item": "widget",
+                "root_cause_category": "infrastructure",
+                "root_cause_summary": "Worker 7 timed out.",
+            },
+            {
+                "job_id": "124",
+                "status": "analyzed",
+                "result_id": 43,
+                "catalog_item": "widget",
+                "root_cause_category": "infrastructure",
+                "root_cause_summary": "Worker 7 timed out.",
+            },
+        ],
+        "cross_job_patterns": [
+            {
+                "pattern": "worker timeout",
+                "jobs": ["123", "124"],
+                "description": "Both jobs time out in worker 7.",
+                "source": "current_batch",
+                "pattern_id": "42",
+                "confidence": "high",
+            }
+        ],
+    }
+
+    store_report.post_analysis_link(
+        connection, {"results_table": "results", "source_table": "events"}, report
+    )
+
+    update_params = [call.args[1] for call in cursor.execute.call_args_list if len(call.args) > 1]
+    assert any(
+        params == ([42, 43], [42, 42], ["high", "high"])
+        for params in update_params
+    )
+    assert report["cross_job_patterns"][0]["pattern_id"] == "42"
+    # Job 124 is linked only through the cross-job pattern (no historical
+    # match), but its source-table FK must still be repointed to the anchor.
+    assert (42, "124") in update_params
     connection.commit.assert_called_once_with()
 
 
@@ -302,27 +359,269 @@ def test_build_root_cause_normalizes_causal_chain_and_misidentifications(tmp_pat
     ]
 
 
-def test_find_match_handles_null_historical_summary(monkeypatch, capsys) -> None:
-    from psycopg2 import sql
+def test_post_analysis_link_updates_a_null_anchor_historical_row() -> None:
+    connection, cursor = _connection_and_cursor()
+    target_row = {
+        "id": 50,
+        "catalog_item": "widget",
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker 7 timed out.",
+        "related_result_id": None,
+        "related_result_confidence": None,
+    }
+    current_row = {
+        "id": 100,
+        "catalog_item": "widget",
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker 7 timed out.",
+        "related_result_id": None,
+        "related_result_confidence": None,
+    }
+    cursor.fetchall.side_effect = [
+        [target_row],
+        [target_row, current_row],
+        [current_row],
+    ]
+    report = {
+        "batch_id": "batch_test",
+        "job_summaries": [
+            {
+                "job_id": "123",
+                "status": "analyzed",
+                "result_id": 100,
+                "catalog_item": "widget",
+                "root_cause_category": "infrastructure",
+                "root_cause_summary": "Worker 7 timed out.",
+                "historical_matches": [
+                    {
+                        "matched_result_id": 50,
+                        "recurrence_count": 2,
+                        "similarity_reasoning": "Both jobs time out in worker 7.",
+                        "confidence": "high",
+                    }
+                ],
+            }
+        ],
+    }
 
-    monkeypatch.setattr(
-        store_report,
-        "known_issue_active_sql",
-        lambda _conn, *, table: sql.SQL("TRUE"),
+    store_report.post_analysis_link(
+        connection, {"results_table": "results", "source_table": "events"}, report
     )
-    cursor = MagicMock()
-    cursor.connection = MagicMock()
-    cursor.fetchall.return_value = [{"id": 7, "root_cause_summary": None}]
 
-    match_id = store_report.find_match(
-        cursor,
-        "results",
-        {
-            "job_id": "123",
-            "root_cause_category": "infrastructure",
-            "catalog_item": "widget",
-            "root_cause_summary": "",
-        },
+    update_params = [call.args[1] for call in cursor.execute.call_args_list if len(call.args) > 1]
+    assert any(
+        params == ([50, 100], [50, 50], ["high", "high"])
+        for params in update_params
+    )
+    assert (50, "123") in update_params
+    assert report["job_summaries"][0]["historical_matches"][0]["pattern_id"] == "50"
+
+
+def test_post_analysis_link_does_not_claim_a_missing_result() -> None:
+    connection, cursor = _connection_and_cursor()
+    cursor.fetchall.return_value = []
+    report = {
+        "batch_id": "batch_test",
+        "job_summaries": [
+            {
+                "job_id": "123",
+                "status": "analyzed",
+                "result_id": 100,
+                "catalog_item": "widget",
+                "root_cause_category": "infrastructure",
+                "root_cause_summary": "Worker 7 timed out.",
+                "historical_matches": [
+                    {
+                        "matched_result_id": 50,
+                        "recurrence_count": 2,
+                        "similarity_reasoning": "Both jobs time out in worker 7.",
+                        "confidence": "high",
+                    }
+                ],
+            }
+        ],
+    }
+
+    store_report.post_analysis_link(
+        connection, {"results_table": "results", "source_table": "events"}, report
     )
 
-    assert match_id == 7
+    update_params = [call.args[1] for call in cursor.execute.call_args_list if len(call.args) > 1]
+    assert update_params == [([50],)]
+    assert "pattern_id" not in report["job_summaries"][0]["historical_matches"][0]
+
+
+def test_post_analysis_link_drops_whole_pattern_when_a_member_row_is_missing() -> None:
+    connection, cursor = _connection_and_cursor()
+    row_1 = {
+        "id": 1,
+        "catalog_item": "widget",
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker 7 timed out.",
+        "related_result_id": None,
+        "related_result_confidence": None,
+    }
+    row_3 = {
+        "id": 3,
+        "catalog_item": "widget",
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker 7 timed out.",
+        "related_result_id": None,
+        "related_result_confidence": None,
+    }
+    # Job 2's result row is missing from the results table (deleted/raced).
+    cursor.fetchall.return_value = [row_1, row_3]
+    report = {
+        "batch_id": "batch_test",
+        "job_summaries": [
+            {"job_id": "1", "status": "analyzed", "result_id": 1},
+            {"job_id": "2", "status": "analyzed", "result_id": 2},
+            {"job_id": "3", "status": "analyzed", "result_id": 3},
+        ],
+        "cross_job_patterns": [
+            {
+                "pattern": "worker timeout",
+                "jobs": ["1", "2", "3"],
+                "description": "All three jobs time out in worker 7.",
+                "source": "current_batch",
+                "confidence": "high",
+            }
+        ],
+    }
+
+    store_report.post_analysis_link(
+        connection, {"results_table": "results", "source_table": "events"}, report
+    )
+
+    update_statements = [
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if "SET related_result_id" in str(call.args[0])
+    ]
+    assert update_statements == []
+    assert "pattern_id" not in report["cross_job_patterns"][0]
+
+
+def test_post_analysis_link_applies_strict_threshold_to_deterministic_fallback_matches() -> None:
+    connection, cursor = _connection_and_cursor()
+    target_row = {
+        "id": 50,
+        "catalog_item": None,
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": (
+            "Worker pool exhausted during provisioning"
+        ),
+        "related_result_id": None,
+        "related_result_confidence": None,
+    }
+    cursor.fetchall.return_value = [target_row]
+    report = {
+        "batch_id": "batch_test",
+        "job_summaries": [
+            {
+                "job_id": "123",
+                "status": "analyzed",
+                "result_id": 100,
+                "catalog_item": None,
+                "root_cause_category": "infrastructure",
+                # ~0.51 SequenceMatcher similarity to target_row's summary: clears
+                # the lenient semantic "high" threshold (0.50) but not the strict
+                # deterministic "low" threshold (0.55) that should apply here.
+                "root_cause_summary": (
+                    "Worker pool exhausted during provisioning"
+                    + " x" * 34
+                ),
+                "historical_matches": [
+                    {
+                        "matched_result_id": 50,
+                        "recurrence_count": 1,
+                        "similarity_reasoning": "Deterministic root-cause summary similarity is 51%.",
+                        "confidence": "high",
+                        "match_source": "deterministic_fallback",
+                        "evidence": [
+                            {
+                                "statement_type": "observed",
+                                "description": "The root-cause summaries are 51% similar.",
+                                "source": "deterministic_fallback",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    store_report.post_analysis_link(
+        connection, {"results_table": "results", "source_table": "events"}, report
+    )
+
+    update_statements = [
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if "SET related_result_id" in str(call.args[0])
+    ]
+    assert update_statements == []
+    assert "pattern_id" not in report["job_summaries"][0]["historical_matches"][0]
+
+
+def test_post_analysis_link_does_not_trust_a_spoofed_evidence_source() -> None:
+    # The semantic aggregator's evidence[].source is free text the LLM controls
+    # (no enum in its schema); only the code-set match_source field may gate the
+    # strict deterministic threshold. A match claiming source="deterministic_fallback"
+    # in its evidence, but lacking match_source, must still be treated as a genuine
+    # semantic match and use the lenient threshold.
+    connection, cursor = _connection_and_cursor()
+    target_row = {
+        "id": 50,
+        "catalog_item": None,
+        "root_cause_category": "infrastructure",
+        "root_cause_summary": "Worker pool exhausted during provisioning",
+        "related_result_id": None,
+        "related_result_confidence": None,
+    }
+    current_row = {**target_row, "id": 100}
+    cursor.fetchall.side_effect = [
+        [target_row],
+        [target_row, current_row],
+        [current_row],
+    ]
+    report = {
+        "batch_id": "batch_test",
+        "job_summaries": [
+            {
+                "job_id": "123",
+                "status": "analyzed",
+                "result_id": 100,
+                "catalog_item": None,
+                "root_cause_category": "infrastructure",
+                "root_cause_summary": "Worker pool exhausted during provisioning" + " x" * 34,
+                "historical_matches": [
+                    {
+                        "matched_result_id": 50,
+                        "recurrence_count": 1,
+                        "similarity_reasoning": "The aggregator judged these related.",
+                        "confidence": "high",
+                        "evidence": [
+                            {
+                                "statement_type": "observed",
+                                "description": "Spoofed source field.",
+                                "source": "deterministic_fallback",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+
+    store_report.post_analysis_link(
+        connection, {"results_table": "results", "source_table": "events"}, report
+    )
+
+    update_statements = [
+        call.args[0]
+        for call in cursor.execute.call_args_list
+        if "SET related_result_id" in str(call.args[0])
+    ]
+    assert len(update_statements) == 1
+    assert report["job_summaries"][0]["historical_matches"][0]["pattern_id"] == "50"
