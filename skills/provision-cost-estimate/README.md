@@ -33,6 +33,24 @@ Get the server URL and an access token from the RHDP reporting platform team.
 Keep the token out of version control: do not commit it, or a `.mcp.json`
 containing it, to this repository.
 
+### Optional: the bundled script
+
+`scripts/catalog_metrics.py` runs the whole method in one command and is
+what the skill tries first:
+
+```bash
+export REPORTING_MCP_TOKEN=<token>   # same token as the MCP server above
+python3 -I scripts/catalog_metrics.py <provision-uuid>
+```
+
+It needs only the Python standard library. `env.example` lists the variables
+(`REPORTING_MCP_TOKEN`, and optionally `REPORTING_MCP_URL` to override the
+default endpoint). If no comparison provisions exist within 30 days it falls
+back to a catalog-level median (`--baseline` shows it as a cross-check). The script calls the MCP server over HTTP itself, so it works
+without a connected MCP client, but it needs the token in the environment.
+Without `REPORTING_MCP_TOKEN` the skill falls back to the manual SQL steps in
+`SKILL.md`.
+
 ### Checking the connection
 
 Run `/mcp` in Claude Code and confirm `reporting-db-prod` is listed as
