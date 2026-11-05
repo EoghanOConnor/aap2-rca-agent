@@ -1,0 +1,274 @@
+name: Batch analysis via CronJob (OpenShift)
+
+# Tier 2: installs the REAL chart via Helm into the CI namespace and runs one
+# batch from the actual CronJob (init container, SSH tunnel, settings secret,
+# CronJob spec), backed entirely by synthetic infrastructure — the chart's
+# db-bastion fields point at the CI sshd pod and its db-remote fields at the
+# CI Postgres, so the CronJob's own tunnel forwards through our sshd to our
+# database. Nothing real is touched.
+#
+# The only GitHub-side secret is KUBECONFIG_B64.
+
+# SECURITY MODEL: on pull_request_target events, the workflow definition runs
+# from the PR's base branch but the PR's code is checked out and executed
+# (Dockerfile RUN steps, ci/* scripts) WITH cluster credentials available.
+# The safe-to-test label is the human trust gate — only add it after reviewing
+# the diff, especially deploy/Dockerfile, ci/*, and workflow-affecting files.
+
+on:
+  push:
+    branches: [ocp-testing]        # dev-branch iteration; drop once the label gate is live on main
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: batch-cronjob
+  cancel-in-progress: false
+
+jobs:
+  cronjob:
+    name: Install the chart and run one batch from the CronJob
+    # Label gate: pull_request_target runs (which get fork PRs and full
+    # secrets) only execute when the safe-to-test label was just added.
+    if: ${{ github.event_name != 'pull_request_target' || github.event.label.name == 'safe-to-test' }}
+    runs-on: ubuntu-latest
+    # WAIT_TIMEOUT_SECS alone allows 20 minutes for the batch; slow in-cluster
+    # image builds (full pip install) and rollouts can add 10+. A healthy but
+    # slow run must not be killed mid-batch.
+    timeout-minutes: 60
+    steps:
+      # In pull_request_target context the default checkout would use the PR's
+      # base branch; explicitly check out the PR head so the PR's code is what
+      # gets tested. Falls back to the event's own SHA on push/dispatch.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      # CI config (ci/ci.env), cluster access, namespace, images and oc. The
+      # ci.env values, NS/IMAGE/SSHD_IMAGE (GITHUB_ENV) and oc (GITHUB_PATH)
+      # become available to every later step.
+      - name: Set up cluster access and tools
+        run: |
+          set -a; . ci/ci.env; set +a
+          grep -E '^[A-Z_]+=' ci/ci.env >> "$GITHUB_ENV"
+
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+          NS=$(kubectl config view --minify -o jsonpath='{..namespace}')
+          if [[ -z "$NS" ]]; then
+            echo "::error::no namespace in the kubeconfig current context" >&2
+            exit 1
+          fi
+          echo "::add-mask::$NS"
+          kubectl get namespace "$NS" > /dev/null
+          echo "NS=$NS" >> "$GITHUB_ENV"
+          echo "IMAGE=image-registry.openshift-image-registry.svc:5000/$NS/rhdp-rca-plugin:latest" >> "$GITHUB_ENV"
+          echo "SSHD_IMAGE=image-registry.openshift-image-registry.svc:5000/$NS/$JUMPBOX_NAME:latest" >> "$GITHUB_ENV"
+
+          # oc is needed for binary builds (oc start-build --from-dir).
+          mkdir -p "$HOME/bin"
+          curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
+            | tar -xz -C "$HOME/bin" oc
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Build the rca image for this commit
+        run: |
+          kubectl apply -n "$NS" -f - <<'EOF'
+          apiVersion: image.openshift.io/v1
+          kind: ImageStream
+          metadata:
+            name: rhdp-rca-plugin
+          EOF
+          kubectl apply -n "$NS" -f - <<'EOF'
+          apiVersion: build.openshift.io/v1
+          kind: BuildConfig
+          metadata:
+            name: rhdp-rca-plugin
+          spec:
+            source:
+              type: Binary
+            strategy:
+              type: Docker
+              dockerStrategy:
+                dockerfilePath: deploy/Dockerfile
+            output:
+              to:
+                kind: ImageStreamTag
+                name: rhdp-rca-plugin:latest
+          EOF
+          oc start-build rhdp-rca-plugin -n "$NS" --from-dir=. --wait
+
+      - name: Generate CI jumpbox keypair
+        run: |
+          rm -f /tmp/ci_jumpbox_key /tmp/ci_jumpbox_key.pub
+          ssh-keygen -t ed25519 -N "" -f /tmp/ci_jumpbox_key -C rca-ci -q
+          kubectl create secret generic "$JUMPBOX_KEY_SECRET" -n "$NS" \
+            --from-file=id_ed25519=/tmp/ci_jumpbox_key \
+            --from-file=id_ed25519.pub=/tmp/ci_jumpbox_key.pub \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Build the CI jumpbox image
+        run: |
+          oc new-build --binary --strategy docker --name "$JUMPBOX_NAME" -n "$NS" 2>/dev/null || true
+          oc start-build "$JUMPBOX_NAME" -n "$NS" --from-dir=ci/images/sshd --wait
+
+      - name: Create CI Postgres and CI jumpbox
+        run: |
+          envsubst '$POSTGRES_NAME $DB_NAME $DB_USER $DB_PASSWORD $DB_PORT' \
+            < ci/manifests/postgres.yaml | kubectl apply -n "$NS" -f -
+          envsubst '$JUMPBOX_NAME $JUMPBOX_KEY_SECRET $JUMPBOX_PORT $JUMPBOX_USER $SSHD_IMAGE' \
+            < ci/manifests/sshd.yaml | kubectl apply -n "$NS" -f -
+          # The keypair is regenerated every run; force the sshd to pick up
+          # the new authorized key rather than relying on secret-volume refresh.
+          kubectl rollout restart deployment/$JUMPBOX_NAME -n "$NS"
+          kubectl rollout status deployment/$POSTGRES_NAME -n "$NS" --timeout=180s
+          kubectl rollout status deployment/$JUMPBOX_NAME -n "$NS" --timeout=180s
+
+      - name: Install the chart with CI values
+        run: |
+          # ci/values-cronjob.yaml holds the chart shape; names, ports, model
+          # and DB settings come from ci/ci.env via --set-string and the
+          # generated settings JSON.
+          # LiteLLM credentials are extracted from the in-cluster secret and
+          # re-fed to Helm, which creates the chart's own secret from them.
+          LITELLM_URL=$(kubectl get secret "$LITELLM_SECRET" -n "$NS" -o jsonpath='{.data.ANTHROPIC_BASE_URL}' | base64 -d)
+          LITELLM_KEY=$(kubectl get secret "$LITELLM_SECRET" -n "$NS" -o jsonpath='{.data.ANTHROPIC_API_KEY}' | base64 -d)
+          echo "::add-mask::$LITELLM_URL"
+          echo "::add-mask::$LITELLM_KEY"
+          if [[ -z "$LITELLM_URL" || -z "$LITELLM_KEY" ]]; then
+            echo "::error::$LITELLM_SECRET is missing ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY" >&2
+            exit 1
+          fi
+
+          # The CronJob reaches Postgres through its own SSH tunnel, so the app
+          # sees it on localhost:$DB_TUNNEL_PORT.
+          jq -n --arg port "$DB_TUNNEL_PORT" '{env: {
+              SOURCE_DB_HOST: "localhost",
+              SOURCE_DB_PORT: $port,
+              SOURCE_DB_NAME: env.DB_NAME,
+              SOURCE_DB_USER: env.DB_USER,
+              SOURCE_DB_PASSWORD: env.DB_PASSWORD,
+              SOURCE_DB_TABLE: env.DB_TABLE,
+              SOURCE_DB_RESULT_TABLE: env.DB_RESULT_TABLE,
+              JOB_LOGS_DIR: env.LOGS_DIR,
+              # The bundled CLI sends an advisor-tool beta header that the
+              # LiteLLM/Vertex upstream rejects with a 400.
+              CLAUDE_CODE_DISABLE_ADVISOR_TOOL: "1"
+            }}' > /tmp/settings-cronjob.json
+
+          helm upgrade --install "$RELEASE" deploy/helm -n "$NS" \
+            -f ci/values-cronjob.yaml \
+            --set-string claude.model="$CLAUDE_MODEL" \
+            --set-string cronjob.maxParallelJobs="$MAX_PARALLEL_JOBS" \
+            --set-string secrets.ssh.bastionHostname="$JUMPBOX_NAME" \
+            --set-string secrets.ssh.bastionUsername="$JUMPBOX_USER" \
+            --set-string secrets.ssh.bastionPort="$JUMPBOX_PORT" \
+            --set-string secrets.ssh.dbBastionHostname="$JUMPBOX_NAME" \
+            --set-string secrets.ssh.dbBastionUsername="$JUMPBOX_USER" \
+            --set-string secrets.ssh.dbBastionPort="$JUMPBOX_PORT" \
+            --set-string secrets.ssh.dbRemoteHost="$POSTGRES_NAME" \
+            --set-string secrets.ssh.dbRemotePort="$DB_PORT" \
+            --set-string secrets.ssh.jumpboxHostname="$JUMPBOX_NAME" \
+            --set-string secrets.ssh.jumpboxUsername="$JUMPBOX_USER" \
+            --set-string secrets.ssh.jumpboxPort="$JUMPBOX_PORT" \
+            --set-string secrets.litellm.baseUrl="$LITELLM_URL" \
+            --set-string secrets.litellm.apiKey="$LITELLM_KEY" \
+            --set-file secrets.skillConfig.settingsJson=/tmp/settings-cronjob.json \
+            --set-file secrets.ssh.privateKey=/tmp/ci_jumpbox_key
+
+      - name: Start workspace helper pod on the chart PVC
+        run: |
+          kubectl delete pod "$WORKSPACE_POD" -n "$NS" --ignore-not-found
+          envsubst '$WORKSPACE_POD $IMAGE $RELEASE' \
+            < ci/manifests/workspace-pod.yaml | kubectl apply -n "$NS" -f -
+          kubectl wait --for=condition=ready "pod/$WORKSPACE_POD" -n "$NS" --timeout=180s
+
+      - name: Seed the database and stage synthetic logs
+        run: |
+          kubectl exec -n "$NS" "$WORKSPACE_POD" -- mkdir -p /tmp/ci
+          kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- bash -c "cat > /tmp/ci/seed_test_db.py" < ci/seed_test_db.py
+          # The workspace pod talks to the Postgres Service directly (no tunnel).
+          kubectl exec -n "$NS" "$WORKSPACE_POD" -- env \
+            RCA_CI_SEED_CONFIRM=1 \
+            SOURCE_DB_HOST="$POSTGRES_NAME" SOURCE_DB_PORT="$DB_PORT" \
+            SOURCE_DB_NAME="$DB_NAME" SOURCE_DB_USER="$DB_USER" SOURCE_DB_PASSWORD="$DB_PASSWORD" \
+            SOURCE_DB_TABLE="$DB_TABLE" SOURCE_DB_RESULT_TABLE="$DB_RESULT_TABLE" \
+            JOB_LOGS_DIR="$LOGS_DIR" \
+            python /tmp/ci/seed_test_db.py
+
+      - name: Run one batch from the CronJob
+        run: |
+          # The batch Job mounts the same ReadWriteOnce PVC; the volume can
+          # only attach to the Job's node once the workspace pod is gone.
+          # Transient Multi-Attach events are expected until the detach
+          # completes; the attach controller retries until it succeeds.
+          kubectl delete pod "$WORKSPACE_POD" -n "$NS" --ignore-not-found
+          kubectl delete job "$JOB_NAME" -n "$NS" --ignore-not-found
+          kubectl create job "$JOB_NAME" -n "$NS" --from="cronjob/$RELEASE-batch"
+          bash ci/wait_for_job.sh
+
+      - name: Fetch and verify the batch report
+        run: |
+          # Capture the batch logs before removing the pod, which holds them.
+          mkdir -p out
+          kubectl logs -n "$NS" "job/$JOB_NAME" --all-containers > out/batch.log || true
+          # The completed Job pod still holds the ReadWriteOnce volume's node
+          # attachment. Delete it (the Job object stays for debugging) so the
+          # recreated workspace pod can attach on any node instead of racing
+          # Multi-Attach detach against the --timeout below.
+          kubectl delete pod -n "$NS" -l "job-name=$JOB_NAME" --ignore-not-found
+          envsubst '$WORKSPACE_POD $IMAGE $RELEASE' \
+            < ci/manifests/workspace-pod.yaml | kubectl apply -n "$NS" -f -
+          kubectl wait --for=condition=ready "pod/$WORKSPACE_POD" -n "$NS" --timeout=180s
+          REPORT=$(kubectl exec -n "$NS" "$WORKSPACE_POD" -- bash -c "ls -1t $STATE_DIR/reports/batch_*.json | head -1")
+          echo "report: $REPORT"
+          kubectl exec -n "$NS" "$WORKSPACE_POD" -- cat "$REPORT" > out/batch_report.json
+          python3 ci/verify_report.py out/batch_report.json
+
+      - name: Verify uploads landed on the CI jumpbox
+        run: |
+          UPLOADED=$(kubectl exec -n "$NS" "deployment/$JUMPBOX_NAME" -- ls -1 /usr/local/mlflow | sort | tr '\n' ' ')
+          echo "uploaded: $UPLOADED"
+          # Capture first so set -e catches a python failure; inside
+          # `for ... in $(...)` it would silently yield an empty loop.
+          ANALYZED=$(python3 -c "
+          import json
+          report = json.load(open('out/batch_report.json'))
+          print(' '.join(s['job_id'] for s in report['job_summaries'] if s['status'] == 'analyzed'))
+          ")
+          for jid in $ANALYZED; do
+            if ! grep -qw "$jid" <<< "$UPLOADED"; then
+              echo "::error::analyzed job $jid has no upload directory on the CI jumpbox"
+              exit 1
+            fi
+          done
+
+      - name: Upload report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-cronjob-run
+          path: out/
+          if-no-files-found: ignore
+
+      - name: Cleanup
+        # Toggle without commits: gh variable set CI_SKIP_CLEANUP --body "true"
+        if: ${{ always() && vars.CI_SKIP_CLEANUP != 'true' }}
+        run: |
+          helm uninstall "$RELEASE" -n "$NS" 2>/dev/null || true
+          kubectl delete job "$JOB_NAME" -n "$NS" --ignore-not-found
+          kubectl delete pod "$WORKSPACE_POD" -n "$NS" --ignore-not-found
+          kubectl delete deployment "$POSTGRES_NAME" service "$POSTGRES_NAME" -n "$NS" --ignore-not-found
+          kubectl delete deployment "$JUMPBOX_NAME" service "$JUMPBOX_NAME" -n "$NS" --ignore-not-found
+          kubectl delete secret "$JUMPBOX_KEY_SECRET" -n "$NS" --ignore-not-found
+
+      - name: Notice cleanup skipped
+        if: ${{ always() && vars.CI_SKIP_CLEANUP == 'true' }}
+        run: |
+          echo "::notice::Cleanup skipped (CI_SKIP_CLEANUP=true) — resources left in the namespace for inspection."

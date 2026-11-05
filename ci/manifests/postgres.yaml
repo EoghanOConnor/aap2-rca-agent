@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${POSTGRES_NAME}
+  labels:
+    app: ${POSTGRES_NAME}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${POSTGRES_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${POSTGRES_NAME}
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        env:
+        - name: POSTGRES_USER
+          value: ${DB_USER}
+        - name: POSTGRES_PASSWORD
+          value: ${DB_PASSWORD}
+        - name: POSTGRES_DB
+          value: ${DB_NAME}
+        # OpenShift runs the pod as an arbitrary UID; the image can only
+        # chmod a data directory it creates itself, so PGDATA must be a
+        # subdirectory of the mounted volume.
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: ${DB_PORT}
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "${DB_USER}", "-d", "${DB_NAME}"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 12
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: pgdata
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${POSTGRES_NAME}
+  labels:
+    app: ${POSTGRES_NAME}
+spec:
+  selector:
+    app: ${POSTGRES_NAME}
+  ports:
+  - port: ${DB_PORT}
+    targetPort: ${DB_PORT}

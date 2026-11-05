@@ -1,0 +1,24 @@
+# Helper pod holding the chart PVC open so the runner can seed the database,
+# stage logs, and fetch the batch report via kubectl exec. Applied twice per
+# run — before seeding and again after the batch Job — because the Job mounts
+# the same ReadWriteOnce PVC and cannot attach it while this pod is running.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${WORKSPACE_POD}
+  labels:
+    app: ${WORKSPACE_POD}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: workspace
+    image: ${IMAGE}
+    command: ["/bin/bash", "-c"]
+    args: ["sleep infinity"]
+    volumeMounts:
+    - name: workspace
+      mountPath: /workspace
+  volumes:
+  - name: workspace
+    persistentVolumeClaim:
+      claimName: ${RELEASE}-pvc

@@ -67,3 +67,6 @@ secrets:
 
 evalPod:
   enabled: false
+
+buildconfig:
+  enabled: true         # set false to install without the OpenShift BuildConfig (e.g. CI)
