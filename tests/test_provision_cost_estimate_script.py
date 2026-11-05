@@ -85,6 +85,8 @@ def test_catalog_baseline_sql_filters():
     sql = mcp.sql[0]
     assert "pmv.environment = 'PROD'" in sql and "pmv.provision_result = 'success'" in sql
     assert "IS DISTINCT FROM" in sql and "ps.catalog_id = 42" in sql
+    assert "ci.asset_uuid = (SELECT asset_uuid FROM catalog_items WHERE id = 42)" in sql
+    assert "pmv.provision_time AS provision_hours" in sql
     assert f"LIMIT {pce.BASELINE_ROWS}" in sql
 
     mcp2 = Capture()
@@ -92,6 +94,39 @@ def test_catalog_baseline_sql_filters():
     assert "pmv.environment = 'EVENT'" in mcp2.sql[0]
     with pytest.raises(ValueError):
         pce.catalog_baseline(Capture(), {**prov, "environment": "x'; --"})
+
+
+def test_catalog_baseline_filters_only_prod_and_event():
+    class Capture(FakeMCP):
+        def query(self, sql):
+            self.sql.append(sql)
+            return []
+
+    prov = {"uuid": "abc-123", "catalog_id": 42, "provisioned_at": "2026-10-29 19:33:17"}
+    dev = Capture()
+    pce.catalog_baseline(dev, {**prov, "environment": "DEV"})
+    assert "pmv.provision_result" not in dev.sql[0] and "IS DISTINCT FROM" not in dev.sql[0]
+    prod = Capture()
+    pce.catalog_baseline(prod, {**prov, "environment": "PROD"})
+    assert "pmv.provision_result = 'success'" in prod.sql[0]
+
+
+def test_baseline_applies_iqr_to_runtime_and_provision_hours():
+    def row(runtime, provision):
+        return {"usage_amount": 10.0, "lifetime_hours": 10.0,
+                "runtime_hours": runtime, "provision_hours": provision}
+
+    rows = [row(float(h), 1.0 + i * 0.1) for i, h in enumerate((8, 9, 10, 11, 12, 8, 9, 10, 11))]
+    rows.append(row(900.0, 1.0))  # runtime outlier
+    rows.append(row(10.0, 500.0))  # provision-time outlier
+    assert pce.baseline_from_rows(rows)["n"] == 9
+
+
+def test_baseline_drops_rows_with_null_provision_hours_like_the_service():
+    rows = [{"usage_amount": float(u), "lifetime_hours": 10.0, "runtime_hours": 10.0,
+             "provision_hours": h}
+            for u, h in ((10, 1.0), (11, 2.0), (12, 3.0), (13, 4.0), (14, None))]
+    assert pce.baseline_from_rows(rows)["n"] == 4
 
 
 def test_comparison_stats_rejects_odd_timestamp():

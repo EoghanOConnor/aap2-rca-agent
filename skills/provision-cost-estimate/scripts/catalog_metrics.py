@@ -31,7 +31,16 @@ WINDOWS_DAYS = (7, 14, 30)
 MIN_N = 3
 # Catalog baseline, adapted from demo-reporting
 # reporting-api/src/app/catalog_item/services/catalog_metrics.py
-# (PROD, success only, infra user excluded, IQR outliers removed, median of cost / lifetime hours).
+# (commit f084048b: CatalogMetricsService). Ported rules:
+#   - success-only and infra-user exclusion apply only to FILTERED_ENVIRONMENTS (PROD, EVENT);
+#   - provisions are grouped by catalog_items.asset_uuid, not catalog_id;
+#   - outliers are removed with a 1.5 x IQR filter on usage_amount, runtime_hours,
+#     lifetime_hours and provision_hours, in that order;
+#   - the rate is the median of usage_amount / lifetime_hours.
+# Deliberate differences: provisions with no cost rows are skipped (the service counts them as
+# zero), and only the latest BASELINE_ROWS provisions in BASELINE_LOOKBACK_DAYS are sampled
+# because the MCP gateway caps a query at 500 rows.
+FILTERED_ENVIRONMENTS = {"PROD", "EVENT"}
 BASELINE_LOOKBACK_DAYS = 180
 BASELINE_ROWS = 400  # the MCP gateway returns at most 500 rows per query
 EXCLUDED_EMAIL = "rhpds-opentlc-infra+rhpds-user@redhat.com"
@@ -139,28 +148,52 @@ def comparison_stats(mcp, prov, days):
     return rows[0]
 
 
+IQR_COLUMNS = ("usage_amount", "runtime_hours", "lifetime_hours", "provision_hours")
+
+
 def iqr_filter(rows, key):
-    """Drop rows whose `key` is outside 1.5 x IQR, as the catalog metrics service does."""
-    if len(rows) < 2:
+    """Drop rows whose `key` is outside 1.5 x IQR, as the catalog metrics service does.
+
+    Mirrors remove_outliers_iqr: a missing column or empty input is returned unchanged, an IQR
+    of 0 keeps every row, and None values (NaN in the service) are ignored when computing the
+    quartiles but fail the range test, so they are dropped whenever the filter is applied.
+    """
+    if not rows or key not in rows[0]:
         return rows
-    q1, _, q3 = statistics.quantiles([r[key] for r in rows], n=4, method="inclusive")
+    values = [r[key] for r in rows if r[key] is not None]
+    if not values:
+        return []
+    if len(values) < 2:
+        return rows
+    q1, _, q3 = statistics.quantiles(values, n=4, method="inclusive")
     iqr = q3 - q1
     if iqr == 0:
         return rows
-    return [r for r in rows if q1 - 1.5 * iqr <= r[key] <= q3 + 1.5 * iqr]
+    return [r for r in rows if r[key] is not None and q1 - 1.5 * iqr <= r[key] <= q3 + 1.5 * iqr]
+
+
+def _num(value):
+    return None if value is None else float(value)
 
 
 def baseline_from_rows(rows):
     """Median cost per lifetime hour after outlier removal, or None if nothing is left."""
-    rows = [
-        {"usage_amount": float(r["usage_amount"]), "lifetime_hours": max(float(r["lifetime_hours"]), 1.0)}
-        for r in rows
-    ]
-    rows = iqr_filter(rows, "usage_amount")
-    rows = iqr_filter(rows, "lifetime_hours")
-    if not rows:
+    cleaned = []
+    for r in rows:
+        row = {
+            "usage_amount": float(r["usage_amount"]),
+            "lifetime_hours": max(float(r["lifetime_hours"]), 1.0),
+        }
+        if "runtime_hours" in r:
+            row["runtime_hours"] = max(_num(r["runtime_hours"]) or 1.0, 1.0)
+        if "provision_hours" in r:
+            row["provision_hours"] = _num(r["provision_hours"])
+        cleaned.append(row)
+    for column in IQR_COLUMNS:
+        cleaned = iqr_filter(cleaned, column)
+    if not cleaned:
         return None
-    rates = [r["usage_amount"] / r["lifetime_hours"] for r in rows]
+    rates = [r["usage_amount"] / r["lifetime_hours"] for r in cleaned]
     return {
         "n": len(rates),
         "median_per_hr": round(statistics.median(rates), 4),
@@ -170,7 +203,7 @@ def baseline_from_rows(rows):
 
 
 def catalog_baseline(mcp, prov):
-    """Catalog-level rate from the latest PROD successes before T0, any window.
+    """Catalog-level rate from the latest provisions of the asset before T0, any window.
 
     Used when the T0-anchored comparison finds nothing, or on request as a cross-check.
     Unlike the metrics service, provisions with no cost rows are skipped rather than
@@ -185,25 +218,40 @@ def catalog_baseline(mcp, prov):
         raise ValueError(f"unexpected environment: {env!r}")
     lower = f"DATE_TRUNC('month', TIMESTAMP '{t0}' - interval '{BASELINE_LOOKBACK_DAYS + 31} days')"
     upper = f"DATE_TRUNC('month', TIMESTAMP '{t0}')"
+    # The service filters success / infra user only for PROD and EVENT.
+    env_filters = ""
+    if env in FILTERED_ENVIRONMENTS:
+        env_filters = (
+            "AND pmv.provision_result = 'success' "
+            f"AND pmv.user_email IS DISTINCT FROM '{EXCLUDED_EMAIL}'"
+        )
+    catalog_id = int(prov["catalog_id"])
     rows = mcp.query(f"""
         WITH sel AS (
-          SELECT ps.uuid, GREATEST(ps.lifetime_hours, 1) AS lifetime_hours
+          SELECT ps.uuid,
+                 CASE WHEN ps.lifetime_hours < 1 THEN 1 ELSE ps.lifetime_hours END AS lifetime_hours,
+                 GREATEST(CASE WHEN ps.runtime_hours > 0 THEN ps.runtime_hours
+                               ELSE ps.lifetime_hours END, 1) AS runtime_hours,
+                 pmv.provision_time AS provision_hours
           FROM provisions_summary ps
           JOIN provisions_mat_v pmv ON pmv.uuid = ps.uuid
-          WHERE ps.catalog_id = {int(prov['catalog_id'])}
+          JOIN catalog_items ci ON ci.id = ps.catalog_id
+          WHERE (ps.catalog_id = {catalog_id}
+                 OR (ci.asset_uuid IS NOT NULL
+                     AND ci.asset_uuid = (SELECT asset_uuid FROM catalog_items WHERE id = {catalog_id})))
             AND ps.uuid <> '{prov['uuid']}'
             AND ps.provisioned_at <  TIMESTAMP '{t0}'
             AND ps.provisioned_at >= TIMESTAMP '{t0}' - interval '{BASELINE_LOOKBACK_DAYS} days'
             AND pmv.environment = '{env}'
-            AND pmv.provision_result = 'success'
-            AND pmv.user_email IS DISTINCT FROM '{EXCLUDED_EMAIL}'
+            {env_filters}
           ORDER BY ps.provisioned_at DESC
           LIMIT {BASELINE_ROWS}
         )
-        SELECT sel.uuid, sel.lifetime_hours, SUM(pc.total_cost) AS usage_amount
+        SELECT sel.uuid, sel.lifetime_hours, sel.runtime_hours, sel.provision_hours,
+               SUM(pc.total_cost) AS usage_amount
         FROM sel JOIN provision_cost pc ON pc.provision_uuid = sel.uuid
         WHERE pc.month_ts >= {lower} AND pc.month_ts <= {upper}
-        GROUP BY sel.uuid, sel.lifetime_hours
+        GROUP BY sel.uuid, sel.lifetime_hours, sel.runtime_hours, sel.provision_hours
     """)
     return baseline_from_rows(rows)
 
