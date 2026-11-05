@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from rca.analysis import cost_estimate
 from rca.analysis.jumpbox_io import upload_to_jumpbox
 from rca.analysis.pipeline import AnalysisPipelineError, get_step_name, run_analysis
 from rca.analysis.setup import find_repo_root, print_checks, run_checks
@@ -62,6 +63,37 @@ def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
     print(f"Analysis directory: {artifacts.analysis_dir}")
     for step in range(1, 5):
         print(f"  - step{step}_{get_step_name(step)}.json")
+    return 0
+
+
+def cmd_cost(args: argparse.Namespace, config: Config) -> int:
+    analysis_dir = config.analysis_dir / args.job_id
+    uuid = args.provision_uuid
+    if not uuid:
+        context_path = analysis_dir / "step1_job_context.json"
+        if not context_path.is_file():
+            logger.error("No step1 for job %s; run analyze first or pass --provision-uuid", args.job_id)
+            return 1
+        job_name = json.loads(context_path.read_text(encoding="utf-8")).get("job_name", "")
+        uuid = cost_estimate.provision_uuid_from_job_name(job_name)
+        if not uuid:
+            logger.error("No provision UUID in job name %r; pass --provision-uuid", job_name)
+            return 1
+    try:
+        result = cost_estimate.estimate(
+            cost_estimate.connect(config.environment), uuid, include_baseline=args.baseline
+        )
+    except cost_estimate.CostEstimateError as exc:
+        logger.error("[ERROR] %s", exc)
+        return 1
+    except Exception as exc:  # network/MCP failure: report, never guess a number
+        logger.error("[ERROR] cost estimate failed: %s: %s", type(exc).__name__, exc)
+        return 1
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    out = analysis_dir / "step4c_cost_estimate.json"
+    out.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
+    print(cost_estimate.render(result))
+    print(f"\nSaved: {out}")
     return 0
 
 
@@ -188,6 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup = subparsers.add_parser("setup", help="Check prerequisites")
     setup.add_argument("--json", action="store_true", help="Output checks as JSON")
 
+    cost = subparsers.add_parser("cost", help="Estimate the cost of the failing provision")
+    cost.add_argument("--job-id", required=True)
+    cost.add_argument("--provision-uuid", help="Override the UUID taken from the job name")
+    cost.add_argument("--baseline", action="store_true", help="Also show the catalog baseline")
+
     status = subparsers.add_parser("status", help="Show saved analysis artifacts")
     status.add_argument("job_id")
 
@@ -213,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = cmd_query(args, config)
     elif args.command == "setup":
         exit_code = cmd_setup(config, args.json)
+    elif args.command == "cost":
+        exit_code = cmd_cost(args, config)
     elif args.command == "status":
         exit_code = cmd_status(args, config)
     elif args.command == "upload":

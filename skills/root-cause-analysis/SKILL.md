@@ -156,13 +156,30 @@ python3 -m venv .venv
 
 ---
 
+### Step 4c: Cost estimate (deterministic)
+
+Run once per job, after `analyze`, to put a dollar figure on the failure:
+
+```bash
+rca-analyze cost --job-id <job-id> [--baseline]
+```
+
+The provision UUID is taken from the job name in `step1_job_context.json`; pass `--provision-uuid <uuid>` to override. The command runs fixed SQL against the `reporting-db-prod` MCP server over HTTP and writes `step4c_cost_estimate.json`. It needs `REPORTING_MCP_TOKEN` (optionally `REPORTING_MCP_URL`) in the environment or settings `env`. Never print the token.
+
+Method (all in `src/rca/analysis/cost_estimate.py`, nothing left to judgement): `median(cost per hour of similar successful provisions) × hours_failing`. The comparison set is the same catalog item, retired in the 7 days before the failing provision started, widened to 14 then 30 days until at least 3 match. If none match, it falls back to a catalog baseline (always low confidence). `provisioned_at` is a proxy for failure start.
+
+Relay the command's figures exactly: estimate, range, `n`, window, confidence. Do not recompute them or run the SQL by hand. Always label the number an estimate, not billed cost. If the command exits non-zero (no token, provision not found, MCP error), say so in the summary and omit the cost; never invent a figure. Only "No estimate possible" in the output means no estimate exists.
+
+---
+
 ## Step 5: Analyze and Generate Summary (Claude's task)
 
 **Input**: Read the following files in order:
 1. **REQUIRED**: `step1_job_context.json` - Job metadata and failed task details
 2. **REQUIRED**: `step3_correlation.json` - Correlated timeline with relevant pod logs (DO NOT read step2 unless needed)
 3. **REQUIRED**: `step4_github_fetch_history.json` - Configuration and code context
-4. **CONDITIONAL**: `step2_splunk_logs.json` - Only read if step3 indicates errors needing deeper investigation
+4. **OPTIONAL**: `step4c_cost_estimate.json` - cost of the failure, if Step 4c ran; cite it in the executive summary
+5. **CONDITIONAL**: `step2_splunk_logs.json` - Only read if step3 indicates errors needing deeper investigation
 
 **Output**: `$RCA_STATE_DIR/.analysis/<job-id>/step5_analysis_summary.json`
 

@@ -1,15 +1,7 @@
-import importlib.util
-from pathlib import Path
-
 import pytest
 
-SCRIPT = (
-    Path(__file__).resolve().parents[1]
-    / "skills/provision-cost-estimate/scripts/catalog_metrics.py"
-)
-spec = importlib.util.spec_from_file_location("catalog_metrics", SCRIPT)
-pce = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(pce)
+from rca.analysis import cost_estimate as pce
+from rca.analysis import cli
 
 
 @pytest.mark.parametrize(
@@ -133,3 +125,100 @@ def test_comparison_stats_rejects_odd_timestamp():
     prov = {"uuid": "abc", "catalog_id": 1, "provisioned_at": "'; DROP TABLE x;--"}
     with pytest.raises(ValueError):
         pce.comparison_stats(FakeMCP(), prov, 7)
+
+
+def test_provision_uuid_from_job_name():
+    name = "RHPDS openshift-cnv.x.dev-sbss5-1-provision-zd4jw 574A0E9C-9845-5db0-94db-b7362caa394d"
+    assert pce.provision_uuid_from_job_name(name) == "574a0e9c-9845-5db0-94db-b7362caa394d"
+    assert pce.provision_uuid_from_job_name("no uuid here") is None
+    assert pce.provision_uuid_from_job_name("") is None
+
+
+class ScriptedMCP:
+    """Answers fetch_provision, then comparison_stats, from fixed rows."""
+
+    def __init__(self, stats):
+        self.stats = stats
+
+    def query(self, sql):
+        if "FROM provisions p" in sql and "p.uuid = " in sql and "hours_failing" in sql:
+            return [{"uuid": "abc-123", "catalog_id": 42, "catalog_name": "cat",
+                     "cloud": "cnv", "last_state": "failed", "provision_result": "failure",
+                     "environment": "DEV", "provisioned_at": "2026-10-29 19:33:17",
+                     "retired_at": None, "hours_failing": "10"}]
+        return [self.stats]
+
+
+def test_estimate_uses_median_times_hours():
+    mcp = ScriptedMCP({"n": 12, "median_per_hr": "2", "min_per_hr": "1", "max_per_hr": "4"})
+    out = pce.estimate(mcp, "abc12345-1234")
+    est = out["estimate"]
+    assert (est["cost_mid"], est["cost_low"], est["cost_high"]) == (20.0, 10.0, 40.0)
+    assert est["confidence"] == "high" and est["source"] == "comparison"
+    assert "ESTIMATED COST: $20.00" in pce.render(out)
+
+
+def test_estimate_without_data_reports_no_estimate():
+    class NoData(ScriptedMCP):
+        def query(self, sql):
+            if "hours_failing" in sql:
+                return super().query(sql)
+            if "pmv" in sql:  # catalog baseline query: no rows
+                return []
+            return [{"n": 0, "median_per_hr": None, "min_per_hr": None, "max_per_hr": None}]
+
+    out = pce.estimate(NoData({}), "abc12345-1234")
+    assert out["estimate"] is None
+    assert "No estimate possible" in pce.render(out)
+
+
+def test_estimate_rejects_bad_uuid_and_missing_provision():
+    with pytest.raises(pce.CostEstimateError):
+        pce.estimate(ScriptedMCP({}), "x'; DROP TABLE y;--")
+
+    class Empty:
+        def query(self, sql):
+            return []
+
+    with pytest.raises(pce.CostEstimateError, match="not found"):
+        pce.estimate(Empty(), "abc12345-1234")
+
+
+def test_connect_requires_token():
+    with pytest.raises(pce.CostEstimateError, match="REPORTING_MCP_TOKEN"):
+        pce.connect({})
+
+
+def test_cost_command_uses_uuid_from_step1_and_saves(monkeypatch, tmp_path, capsys):
+    from types import SimpleNamespace
+
+    job_dir = tmp_path / "77"
+    job_dir.mkdir()
+    (job_dir / "step1_job_context.json").write_text(
+        '{"job_name": "RHPDS x 574a0e9c-9845-5db0-94db-b7362caa394d"}'
+    )
+    seen = {}
+    monkeypatch.setattr(pce, "connect", lambda env: object())
+    monkeypatch.setattr(
+        pce, "estimate",
+        lambda mcp, uuid, include_baseline=False: seen.update(uuid=uuid) or {
+            "provision": {"uuid": uuid, "catalog_name": "c", "catalog_id": 1, "cloud": "x",
+                          "last_state": "failed", "provision_result": "failure",
+                          "provisioned_at": "t"},
+            "hours_failing": 1.0, "hours_failing_basis": "proxy", "window_days": 7,
+            "estimate": None, "note": "No estimate possible: test", "disclaimer": "d"},
+    )
+    config = SimpleNamespace(analysis_dir=tmp_path, environment={})
+    args = SimpleNamespace(job_id="77", provision_uuid=None, baseline=False)
+    assert cli.cmd_cost(args, config) == 0
+    assert seen["uuid"] == "574a0e9c-9845-5db0-94db-b7362caa394d"
+    assert (job_dir / "step4c_cost_estimate.json").is_file()
+
+
+def test_cost_command_without_uuid_fails(tmp_path):
+    from types import SimpleNamespace
+
+    (tmp_path / "5").mkdir()
+    (tmp_path / "5" / "step1_job_context.json").write_text('{"job_name": "no uuid"}')
+    config = SimpleNamespace(analysis_dir=tmp_path, environment={})
+    assert cli.cmd_cost(SimpleNamespace(job_id="5", provision_uuid=None, baseline=False), config) == 1

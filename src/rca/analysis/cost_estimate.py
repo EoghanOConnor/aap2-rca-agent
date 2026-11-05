@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Estimate the cost of a failing provision from similar successful ones.
+"""Estimate what a failing provision costs, from similar successful provisions.
 
-Same method as the provision-cost-estimate skill:
+Deterministic: every number comes from SQL run through the reporting-db-prod MCP
+server over HTTP; nothing here is left to model judgement.
+
     estimated_cost = median(cost per hour of similar provisions) x hours_failing
-where "similar" = same catalog_id, provision_result = 'success', retired in the
-window before the failing provision started (T0). The window widens 7 -> 14 -> 30
-days until at least MIN_N provisions match.
 
-If no comparison provisions are found even at 30 days, it falls back to a catalog
-baseline: the median cost per lifetime hour of the catalog item's recent PROD
-successes with outliers removed (the method used by demo-reporting's catalog metrics).
-`--baseline` also prints that value as a cross-check. The estimate always uses the median.
+"Similar" = same catalog_id, provision_result = 'success', retired in the window
+before the failing provision started (T0). The window widens 7 -> 14 -> 30 days
+until at least MIN_N provisions match. If none match, it falls back to a catalog
+baseline (median cost per lifetime hour of the catalog item's recent provisions
+with outliers removed, following demo-reporting's CatalogMetricsService).
 
-Queries go to the reporting-db-prod MCP server over HTTP. See env.example.
+Environment: REPORTING_MCP_TOKEN (required), REPORTING_MCP_URL (optional).
 
-    export REPORTING_MCP_TOKEN=...            # required
-    export REPORTING_MCP_URL=...              # optional, defaults below
-    python3 catalog_metrics.py [--baseline] <provision-uuid>
+    rca-analyze cost --job-id <id> [--provision-uuid <uuid>] [--baseline]
 """
 import argparse
 import json
@@ -25,6 +23,8 @@ import re
 import statistics
 import sys
 import urllib.request
+from collections.abc import Mapping
+from typing import Any
 
 DEFAULT_URL = "https://reporting-mcp.apps.ocpv-infra01.dal12.infra.demo.redhat.com/mcp/"
 WINDOWS_DAYS = (7, 14, 30)
@@ -52,7 +52,7 @@ class MCP:
         self.url, self.token, self.session, self._id = url, token, None, 0
         self._rpc("initialize", {
             "protocolVersion": "2025-03-26", "capabilities": {},
-            "clientInfo": {"name": "provision-cost-estimate", "version": "1"},
+            "clientInfo": {"name": "rca-cost-estimate", "version": "1"},
         })
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
@@ -262,23 +262,28 @@ def confidence(n, days):
     return "high" if n >= 10 else "medium"
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("uuid", help="provisions.uuid")
-    ap.add_argument("--baseline", action="store_true",
-                    help="also show the catalog-level baseline median as a cross-check")
-    args = ap.parse_args()
+JOB_NAME_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
 
-    if not UUID_RE.match(args.uuid):
-        sys.exit("error: not a valid provision UUID")
-    token = os.environ.get("REPORTING_MCP_TOKEN")
-    if not token:
-        sys.exit("error: set REPORTING_MCP_TOKEN")
-    mcp = MCP(os.environ.get("REPORTING_MCP_URL", DEFAULT_URL), token)
 
-    prov = fetch_provision(mcp, args.uuid)
+class CostEstimateError(Exception):
+    """Raised when no estimate can be attempted (missing token, bad UUID, not found)."""
+
+
+def provision_uuid_from_job_name(job_name: str) -> str | None:
+    """Return the UUID that AAP appends to the job name, if there is one."""
+    match = JOB_NAME_UUID_RE.search(job_name or "")
+    return match.group(0).lower() if match else None
+
+
+def estimate(mcp, uuid: str, *, include_baseline: bool = False) -> dict[str, Any]:
+    """Run the full method and return a structured result (no printing)."""
+    if not UUID_RE.match(uuid):
+        raise CostEstimateError(f"not a valid provision UUID: {uuid!r}")
+    prov = fetch_provision(mcp, uuid)
     if not prov:
-        sys.exit(f"Provision {args.uuid} not found.")
+        raise CostEstimateError(f"Provision {uuid} not found.")
 
     stats, used = None, None
     for days in WINDOWS_DAYS:
@@ -286,41 +291,92 @@ def main():
         if stats["n"] >= MIN_N:
             break
 
-    print(f"Provision:  {prov['uuid']}")
-    print(f"Catalog:    {prov['catalog_name']} (id {prov['catalog_id']})")
-    print(f"Cloud/state: {prov['cloud']} / {prov['last_state']} (result: {prov['provision_result']}, "
-          f"environment: {prov.get('environment') or 'unknown'})")
-    print(f"Failing since {prov['provisioned_at']}: {prov['hours_failing']} h "
-          "(provisioned_at is a proxy for failure start)")
-    baseline = catalog_baseline(mcp, prov) if (args.baseline or not stats["n"]) else None
-    hrs = float(prov["hours_failing"])
+    baseline = catalog_baseline(mcp, prov) if (include_baseline or not stats["n"]) else None
+    result: dict[str, Any] = {
+        "provision": {k: prov.get(k) for k in (
+            "uuid", "catalog_id", "catalog_name", "cloud", "last_state",
+            "provision_result", "environment", "provisioned_at", "retired_at",
+        )},
+        "hours_failing": float(prov["hours_failing"]),
+        "hours_failing_basis": "provisioned_at is a proxy for failure start",
+        "window_days": used,
+        "baseline": baseline,
+        "estimate": None,
+        "disclaimer": "Estimate, not billed cost; cost data can lag a day or more.",
+    }
     if stats["n"]:
-        src = f"Comparison: {stats['n']} provisions, {used} days before T0"
-        conf = confidence(stats["n"], used)
-        rates = stats
+        source, rates, conf = "comparison", stats, confidence(stats["n"], used)
     elif baseline:
-        src = (f"Comparison: none in {used} days before T0; using the catalog baseline "
-               f"({baseline['n']} recent PROD provisions, outliers removed)")
-        conf = "low"
-        rates = baseline
+        source, rates, conf = "catalog_baseline", baseline, "low"
     else:
-        print(f"\nNo estimate possible: no successful comparison provisions in {used} days before T0, "
-              "and no catalog baseline.")
-        return
+        result["note"] = (
+            f"No estimate possible: no successful comparison provisions in {used} days "
+            "before T0, and no catalog baseline."
+        )
+        return result
+
     med, lo, hi = (float(rates[k]) for k in ("median_per_hr", "min_per_hr", "max_per_hr"))
-    print(src)
-    print(f"Cost/hour:  median {med} (min {lo} - max {hi})")
-    if args.baseline and stats["n"] and baseline:
-        print(f"Cross-check: catalog baseline median {baseline['median_per_hr']} "
-              f"(n={baseline['n']}, min {baseline['min_per_hr']} - max {baseline['max_per_hr']})")
-    elif args.baseline and stats["n"]:
-        print("Cross-check: no catalog baseline available.")
-    print(f"\nESTIMATED COST: ${med * hrs:,.2f}  (range ${lo * hrs:,.2f} - ${hi * hrs:,.2f})")
-    print(f"Confidence: {conf}")
-    if med == hi:
-        print("Note: median equals max; cost per hour is skewed.")
-    print("This is an estimate, not billed cost; cost data can lag a day or more.")
+    hrs = result["hours_failing"]
+    result["estimate"] = {
+        "source": source,
+        "n": int(rates["n"]),
+        "confidence": conf,
+        "median_per_hr": med,
+        "min_per_hr": lo,
+        "max_per_hr": hi,
+        "cost_mid": round(med * hrs, 2),
+        "cost_low": round(lo * hrs, 2),
+        "cost_high": round(hi * hrs, 2),
+        "skewed": med == hi,
+    }
+    return result
 
 
-if __name__ == "__main__":
-    main()
+def render(result: Mapping[str, Any]) -> str:
+    """Format an ``estimate`` result as the human-readable report."""
+    prov = result["provision"]
+    lines = [
+        f"Provision:  {prov['uuid']}",
+        f"Catalog:    {prov['catalog_name']} (id {prov['catalog_id']})",
+        f"Cloud/state: {prov['cloud']} / {prov['last_state']} (result: {prov['provision_result']}, "
+        f"environment: {prov.get('environment') or 'unknown'})",
+        f"Failing since {prov['provisioned_at']}: {result['hours_failing']} h "
+        f"({result['hours_failing_basis']})",
+    ]
+    est = result["estimate"]
+    if not est:
+        lines += ["", result["note"]]
+        return "\n".join(lines)
+    if est["source"] == "comparison":
+        lines.append(f"Comparison: {est['n']} provisions, {result['window_days']} days before T0")
+    else:
+        lines.append(
+            f"Comparison: none in {result['window_days']} days before T0; using the catalog "
+            f"baseline ({est['n']} recent provisions, outliers removed)"
+        )
+    lines.append(
+        f"Cost/hour:  median {est['median_per_hr']} (min {est['min_per_hr']} - max {est['max_per_hr']})"
+    )
+    base = result.get("baseline")
+    if base and est["source"] == "comparison":
+        lines.append(
+            f"Cross-check: catalog baseline median {base['median_per_hr']} "
+            f"(n={base['n']}, min {base['min_per_hr']} - max {base['max_per_hr']})"
+        )
+    lines += [
+        "",
+        f"ESTIMATED COST: ${est['cost_mid']:,.2f}  "
+        f"(range ${est['cost_low']:,.2f} - ${est['cost_high']:,.2f})",
+        f"Confidence: {est['confidence']}",
+    ]
+    if est["skewed"]:
+        lines.append("Note: median equals max; cost per hour is skewed.")
+    lines.append(result["disclaimer"])
+    return "\n".join(lines)
+
+
+def connect(environment: Mapping[str, str]) -> MCP:
+    token = environment.get("REPORTING_MCP_TOKEN")
+    if not token:
+        raise CostEstimateError("set REPORTING_MCP_TOKEN")
+    return MCP(environment.get("REPORTING_MCP_URL") or DEFAULT_URL, token)
