@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Literal
 
+from rca.batch.task_signature import TaskSignature
+
 Confidence = Literal["high", "medium", "low"]
 MatchStage = Literal["pre_analysis", "post_analysis"]
 
@@ -31,6 +33,7 @@ class MatchSignals:
     catalog_item: str | None
     text: str | None
     category: str | None = None
+    task_signature: TaskSignature | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,41 @@ def score_similarity(
     right_text = _clean(right.text)
     if left_text is None or right_text is None:
         return ScoreResult(None, 0.0, ())
+
+    if stage == "pre_analysis":
+        left_signature = left.task_signature
+        right_signature = right.task_signature
+        if (
+            left_signature is not None
+            and right_signature is not None
+            and left_signature.is_complete
+            and right_signature.is_complete
+        ):
+            if left_signature.identity_key == right_signature.identity_key:
+                error_similarity = text_similarity(
+                    left_signature.normalized_error, right_signature.normalized_error
+                )
+                evidence = (
+                    _evidence(
+                        "observed",
+                        "Both results failed on the same normalized Ansible task identity.",
+                        "task_signature",
+                    ),
+                    _evidence(
+                        "observed",
+                        f"Normalized error similarity is {error_similarity:.0%}.",
+                        "task_signature",
+                    ),
+                )
+                if error_similarity < 0.75:
+                    return ScoreResult(None, error_similarity, evidence)
+                if not _pre_analysis_text_is_specific(
+                    left_signature.normalized_error,
+                    right_signature.normalized_error,
+                    same_catalog=True,
+                ):
+                    return ScoreResult(None, error_similarity, evidence)
+                return ScoreResult("high", error_similarity, evidence)
 
     similarity = text_similarity(left_text, right_text)
     left_catalog = _clean(left.catalog_item)

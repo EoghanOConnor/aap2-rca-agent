@@ -4,28 +4,28 @@ flowchart TD
 
     subgraph Gate["Pre-analysis gate"]
         direction TB
-        JobContext["Load job context
+        JobContext["Load job log and source metadata
 job_name + error_message"]
-        Catalog["Extract catalog item
-from job_name"]
-        Signal["Build current match signal
-catalog item + error_message"]
-        Duplicate{"Same catalog item and
-specific, similar error_message?"}
+        FailedTask["Extract first failed task
+play, role, task, action, path, error"]
+        Signature["Build normalized task signature
+fallback: catalog item + error_message"]
+        Duplicate{"Same task signature and
+similar, specific error?"}
         Group["Group duplicate jobs
 under one representative"]
         Keep["Keep job separate"]
         Known{"Known, unambiguous issue
-with a similar error_message?"}
+for this task signature?"}
         Skip["Link to known issue
 and skip full analysis"]
         Analyze["Analyze representative job"]
     end
 
     Jobs --> JobContext
-    JobContext --> Catalog
-    Catalog --> Signal
-    Signal --> Duplicate
+    JobContext --> FailedTask
+    FailedTask --> Signature
+    Signature --> Duplicate
     Duplicate -- Yes --> Group
     Duplicate -- No --> Keep
     Group --> Known

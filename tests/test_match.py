@@ -4,6 +4,7 @@ from rca.batch.match import (
     score_similarity,
     weakest_confidence,
 )
+from rca.batch.task_signature import TaskSignature
 
 
 def test_pre_analysis_uses_stricter_cross_catalog_threshold() -> None:
@@ -24,6 +25,41 @@ def test_pre_analysis_rejects_generic_cross_catalog_errors() -> None:
 
     assert result.confidence is None
     assert any("too generic" in item["description"] for item in result.evidence)
+
+
+def test_pre_analysis_signature_mismatch_falls_back_to_shared_signals() -> None:
+    left_signature = TaskSignature(
+        play="Setup",
+        role="common",
+        task="Install dependencies",
+        task_action="yum",
+        task_path="/roles/common/tasks/main.yml:10",
+        error_message="Connection reset by peer",
+    )
+    right_signature = TaskSignature(
+        play="Setup",
+        role="common",
+        task="Install dependencies",
+        task_action="yum",
+        task_path="/roles/common/tasks/other.yml:42",
+        error_message="Connection reset by peer",
+    )
+
+    result = score_similarity(
+        MatchSignals(
+            catalog_item="widget",
+            text="Connection reset by peer",
+            task_signature=left_signature,
+        ),
+        MatchSignals(
+            catalog_item="widget",
+            text="Connection reset by peer",
+            task_signature=right_signature,
+        ),
+        "pre_analysis",
+    )
+
+    assert result.confidence == "high"
 
 
 def test_post_analysis_semantic_judgment_is_bounded_by_category() -> None:

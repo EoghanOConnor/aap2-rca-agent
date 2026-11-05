@@ -26,19 +26,27 @@ from rca.config import Config
 from rca.models import AnalysisSummary, BatchSemanticOutput
 
 
-def _config(tmp_path: Path, *, max_parallel_jobs: int = 2) -> Config:
+def _config(
+    tmp_path: Path,
+    *,
+    max_parallel_jobs: int = 2,
+    job_logs_dir: Path | None = None,
+) -> Config:
+    environment = {
+        "RCA_STATE_DIR": str(tmp_path),
+        "RCA_MAX_PARALLEL_JOBS": str(max_parallel_jobs),
+        "SOURCE_DB_NAME": "rca",
+        "SOURCE_DB_USER": "agent",
+        "SOURCE_DB_PASSWORD": "not-a-real-secret",
+        "SOURCE_DB_TABLE": "aap2_events",
+        "SOURCE_DB_RESULT_TABLE": "aap2_job_results",
+        "JUMPBOX_URI": "agent@jumpbox.example.test",
+        "SSH_JUMPBOX_ALIAS": "ci-jumpbox",
+    }
+    if job_logs_dir is not None:
+        environment["JOB_LOGS_DIR"] = str(job_logs_dir)
     return Config.from_env(
-        environment={
-            "RCA_STATE_DIR": str(tmp_path),
-            "RCA_MAX_PARALLEL_JOBS": str(max_parallel_jobs),
-            "SOURCE_DB_NAME": "rca",
-            "SOURCE_DB_USER": "agent",
-            "SOURCE_DB_PASSWORD": "not-a-real-secret",
-            "SOURCE_DB_TABLE": "aap2_events",
-            "SOURCE_DB_RESULT_TABLE": "aap2_job_results",
-            "JUMPBOX_URI": "agent@jumpbox.example.test",
-            "SSH_JUMPBOX_ALIAS": "ci-jumpbox",
-        },
+        environment=environment,
         env_file=tmp_path / "missing.env",
     )
 
@@ -93,6 +101,139 @@ def test_main_parses_batch_options_and_calls_python_orchestrator(
         limit=7,
         no_pre_filter=True,
         dry_run=False,
+    )
+
+
+def test_pre_analysis_context_loader_fetches_missing_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    job_logs_dir = tmp_path / "logs"
+    job_logs_dir.mkdir()
+    config = _config(tmp_path, job_logs_dir=job_logs_dir)
+    pool = object()
+
+    def fake_resolve_job_log(
+        *,
+        config: Config,
+        job_id: str | None,
+        job_log: str | Path | None,
+        fetch: bool,
+        db_pool: object,
+    ) -> tuple[Path, str | None]:
+        assert fetch is True
+        assert job_id == "101"
+        assert db_pool is pool
+        log_path = job_logs_dir / "job_101.json"
+        log_path.write_text(
+            json.dumps(
+                {
+                    "events": [
+                        {
+                            "failed": True,
+                            "event": "runner_on_failed",
+                            "task": "Install dependencies",
+                            "play": "Setup",
+                            "role": "common",
+                            "created": "2026-01-01T00:00:00Z",
+                            "event_data": {
+                                "res": {"msg": "Connection reset by peer"},
+                                "task_path": "/roles/common/tasks/main.yml:10",
+                                "task_action": "yum",
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return log_path, job_id
+
+    monkeypatch.setattr(
+        "rca.analysis.pipeline._resolve_job_log", fake_resolve_job_log
+    )
+
+    contexts, job_log_paths = orchestrator._load_pre_analysis_contexts(
+        [101], config, pool
+    )
+
+    assert contexts[101]["failed_tasks"][0]["task"] == "Install dependencies"
+    assert job_log_paths == {101: job_logs_dir / "job_101.json"}
+
+
+def test_historical_task_signatures_load_from_saved_analysis_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    analysis_dir = config.analysis_dir / "77"
+    analysis_dir.mkdir(parents=True)
+    (analysis_dir / "step1_job_context.json").write_text(
+        json.dumps(
+            {
+                "failed_tasks": [
+                    {
+                        "play": "Setup",
+                        "role": "common",
+                        "task": "Install dependencies",
+                        "task_action": "yum",
+                        "task_path": "/roles/common/tasks/main.yml",
+                        "error_message": "Connection reset by peer",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    results = [{"id": 77, "job_id": 77}]
+
+    orchestrator._attach_historical_task_signatures(results, config)
+
+    assert results[0]["task_signature"].identity_key == (
+        "setup",
+        "common",
+        "install dependencies",
+        "yum",
+        "/roles/common/tasks/main.yml",
+    )
+
+
+def test_historical_task_signatures_fall_back_to_local_job_logs(
+    tmp_path: Path,
+) -> None:
+    job_logs_dir = tmp_path / "logs"
+    job_logs_dir.mkdir()
+    (job_logs_dir / "job_77.json").write_text(
+        json.dumps(
+            {
+                "events": [
+                    {
+                        "failed": True,
+                        "event": "runner_on_failed",
+                        "task": "Install dependencies",
+                        "play": "Setup",
+                        "role": "",
+                        "created": "2026-01-01T00:00:00Z",
+                        "event_data": {
+                            "res": {"msg": "Connection reset by peer"},
+                            "task_path": "/roles/common/tasks/main.yml:10",
+                            "task_action": "yum",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _config(tmp_path, job_logs_dir=job_logs_dir)
+    results = [{"id": 77, "job_id": 77}]
+
+    orchestrator._attach_historical_task_signatures(results, config)
+
+    assert results[0]["task_signature"].identity_key == (
+        "setup",
+        "",
+        "install dependencies",
+        "yum",
+        "/roles/common/tasks/main.yml",
     )
 
 
@@ -798,6 +939,62 @@ def test_failed_representative_falls_back_to_next_duplicate(
     assert [execution.job_id for execution in executions] == ["100", "101"]
     assert executions[-1].job_id == "101"
     assert updated_dupes == [{"job_id": 102, "representative_job_id": 101}]
+
+
+def test_pre_analysis_fetches_contexts_only_for_unresolved_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    pool = object()
+    metadata = {
+        10: {"job_name": "RHPDS platform.widget.dev-10-create"},
+        11: {"job_name": "RHPDS platform.widget.dev-11-create"},
+        12: {"job_name": "RHPDS platform.widget.dev-12-create"},
+    }
+    recent_results = [
+        {
+            "id": 90,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "root_cause_summary": "Known issue",
+        }
+    ]
+    context = {"failed_tasks": [{"task": "Install dependencies"}]}
+    log_path = tmp_path / "job_10.json"
+    gate_task_contexts = []
+
+    def fake_pre_analysis_gate(
+        job_ids: list[int],
+        job_metadata: dict[int, dict[str, object]],
+        historical: list[dict[str, object]],
+        *,
+        use_history: bool,
+        task_contexts: dict[int, dict[str, object]] | None = None,
+    ) -> tuple[list[int], dict[int, int], list[dict[str, object]]]:
+        gate_task_contexts.append(task_contexts)
+        if task_contexts is None:
+            return [10], {11: 90, 12: 90}, []
+        return [], {11: 90, 12: 90}, []
+
+    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
+    monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[10, 11, 12]))
+    monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value=metadata))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=recent_results))
+    monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[]))
+    monkeypatch.setattr(orchestrator, "_attach_historical_task_signatures", Mock())
+    monkeypatch.setattr(orchestrator, "pre_analysis_gate", fake_pre_analysis_gate)
+    context_loader = Mock(return_value=({10: context}, {10: log_path}))
+    monkeypatch.setattr(orchestrator, "_load_pre_analysis_contexts", context_loader)
+    monkeypatch.setattr(orchestrator, "store_pre_matched", Mock())
+    analyze_jobs = Mock()
+    monkeypatch.setattr(orchestrator, "_analyze_jobs", analyze_jobs)
+
+    assert orchestrator.run_batch(config, pool=pool, cwd=tmp_path) == 0
+
+    assert gate_task_contexts == [None, {10: context}]
+    assert context_loader.call_args.args == ([10], config, pool)
+    analyze_jobs.assert_not_called()
 
 
 def test_dry_run_writes_report_without_database_or_jumpbox_writes(

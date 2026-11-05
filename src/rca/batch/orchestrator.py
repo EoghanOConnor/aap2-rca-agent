@@ -28,7 +28,14 @@ from pydantic import ValidationError
 
 from rca.analysis.bastion_resolver import ensure_jumpbox_alias
 from rca.analysis.jumpbox_io import upload_to_jumpbox
-from rca.analysis.pipeline import AnalysisArtifacts, run_analysis
+from rca.analysis.job_parser import parse_job_log
+from rca.analysis.pipeline import (
+    AnalysisArtifacts,
+    AnalysisPipelineError,
+    load_job_context,
+    load_step,
+    run_analysis,
+)
 from rca.analysis.tracing import set_pipeline_tracing_enabled
 from rca.batch.fetch_known_issues import fetch_known_issues
 from rca.batch.match import MatchSignals, score_similarity
@@ -38,6 +45,7 @@ from rca.batch.pre_filter_jobs import (
     pre_matched_entries,
     pre_analysis_gate,
 )
+from rca.batch.task_signature import build_task_signature
 from rca.batch.query_source_db import query_job_ids
 from rca.batch.store_report import (
     link_intra_batch_dupes,
@@ -177,6 +185,87 @@ def _batch_database_config(config: Config) -> dict[str, Any]:
     database["host"] = database.get("host") or "localhost"
     database["port"] = int(database.get("port") or 5432)
     return database
+
+
+def _load_pre_analysis_contexts(
+    job_ids: list[int], config: Config, db_pool: Any
+) -> tuple[dict[int, dict[str, Any]], dict[int, Path]]:
+    """Load incoming task contexts, fetching missing job logs."""
+
+    contexts: dict[int, dict[str, Any]] = {}
+    job_log_paths: dict[int, Path] = {}
+
+    def load_one(job_id: int) -> tuple[int, Path | None, dict[str, Any] | None, Exception | None]:
+        try:
+            path, _requested_job_id, context = load_job_context(
+                config=config,
+                job_id=str(job_id),
+                fetch=True,
+                db_pool=db_pool,
+            )
+            return job_id, path, context, None
+        except (AnalysisPipelineError, OSError, ValueError) as exc:
+            return job_id, None, None, exc
+
+    with ThreadPoolExecutor(
+        max_workers=config.max_parallel_jobs,
+        thread_name_prefix="rca-preanalysis",
+    ) as executor:
+        outcomes = list(executor.map(load_one, job_ids))
+
+    failed_outcomes: list[tuple[int, Exception]] = []
+    for job_id, path, context, exc in outcomes:
+        if exc is not None:
+            failed_outcomes.append((job_id, exc))
+            continue
+        if path is None or context is None:
+            continue
+        contexts[job_id] = context
+        job_log_paths[job_id] = path
+
+    if failed_outcomes:
+        logger.warning(
+            "Could not load task context for %d of %d job(s); using fallback signals",
+            len(failed_outcomes),
+            len(job_ids),
+        )
+        for job_id, exc in failed_outcomes:
+            logger.debug("Job %s task-context load failed: %s", job_id, exc)
+
+    return contexts, job_log_paths
+
+
+def _attach_historical_task_signatures(
+    results: list[dict[str, Any]], config: Config
+) -> None:
+    """Attach local task signatures to recent results without changing schemas."""
+
+    for result in results:
+        context = None
+        analysis_path = result.get("analysis_path")
+        if analysis_path:
+            try:
+                context = load_step(Path(str(analysis_path)).expanduser(), 1)
+            except (OSError, ValueError):
+                context = None
+        if context is None and result.get("job_id") is not None:
+            try:
+                context = load_step(
+                    config.analysis_dir / str(result["job_id"]),
+                    1,
+                )
+            except (OSError, ValueError):
+                context = None
+        if context is None and result.get("job_id") is not None:
+            job_log = config.find_job_log(str(result["job_id"]))
+            if job_log is not None:
+                try:
+                    context = parse_job_log(job_log)
+                except (OSError, ValueError):
+                    context = None
+        signature = build_task_signature(context)
+        if signature is not None:
+            result["task_signature"] = signature
 
 
 def _create_connection_pool(config: Config) -> ThreadedConnectionPool:
@@ -392,17 +481,26 @@ async def _execute_one_job(
     sdk_semaphore: asyncio.Semaphore,
     cwd: Path,
     dry_run: bool,
+    job_log: Path | None = None,
 ) -> JobExecution:
     rendered_id = str(job_id)
     started = time.monotonic()
     loop = asyncio.get_running_loop()
     artifacts: AnalysisArtifacts | None = None
     result: SDKQueryResult | None = None
+    analysis_kwargs: dict[str, Any] = {
+        "config": config,
+        "job_id": rendered_id,
+        "fetch": job_log is None,
+        "db_pool": db_pool,
+    }
+    if job_log is not None:
+        analysis_kwargs["job_log"] = job_log
 
     try:
         artifacts = await loop.run_in_executor(
             executor,
-            partial(run_analysis, config=config, job_id=rendered_id, fetch=True, db_pool=db_pool),
+            partial(run_analysis, **analysis_kwargs),
         )
     except Exception as exc:
         return JobExecution(
@@ -527,6 +625,7 @@ async def _analyze_one_job(
     sdk_semaphore: asyncio.Semaphore,
     cwd: Path,
     dry_run: bool,
+    job_log: Path | None = None,
 ) -> JobExecution:
     """Keep deterministic analysis and its Agent SDK query under one job limit."""
     async with job_semaphore:
@@ -538,6 +637,7 @@ async def _analyze_one_job(
             sdk_semaphore,
             cwd,
             dry_run,
+            job_log,
         )
 
 
@@ -548,6 +648,7 @@ async def _analyze_jobs(
     *,
     cwd: Path,
     dry_run: bool = False,
+    job_log_paths: Mapping[int, Path] | None = None,
 ) -> list[JobExecution]:
     job_semaphore = asyncio.Semaphore(config.max_parallel_jobs)
     sdk_semaphore = asyncio.Semaphore(config.max_parallel_jobs)
@@ -564,6 +665,7 @@ async def _analyze_jobs(
                 sdk_semaphore,
                 cwd,
                 dry_run,
+                job_log_paths.get(job_id) if job_log_paths else None,
             )
             for job_id in job_ids
         ]
@@ -1257,6 +1359,7 @@ def _recover_failed_representatives(
     *,
     cwd: Path,
     dry_run: bool = False,
+    job_log_paths: Mapping[int, Path] | None = None,
 ) -> tuple[list[JobExecution], list[dict[str, Any]]]:
     """Analyze another duplicate when its representative fails."""
 
@@ -1281,14 +1384,14 @@ def _recover_failed_representatives(
                 representative,
                 candidate,
             )
+            analyze_kwargs: dict[str, Any] = {
+                "cwd": cwd,
+                "dry_run": dry_run,
+            }
+            if job_log_paths is not None:
+                analyze_kwargs["job_log_paths"] = job_log_paths
             recovered = asyncio.run(
-                _analyze_jobs(
-                    [candidate],
-                    config,
-                    pool,
-                    cwd=cwd,
-                    dry_run=dry_run,
-                )
+                _analyze_jobs([candidate], config, pool, **analyze_kwargs)
             )
             executions.extend(recovered)
             if recovered and recovered[0].status == "completed":
@@ -1399,7 +1502,6 @@ def run_batch(
             return 0
 
         logger.info("Found %d job(s): %s", len(job_ids), ", ".join(map(str, job_ids)))
-        logger.info("[STEP 1a] Running unified pre-analysis gate")
         try:
             with pooled_connection(pool) as conn:
                 metadata = fetch_job_metadata(conn, database["source_table"], job_ids)
@@ -1421,6 +1523,29 @@ def run_batch(
                     )
             except psycopg2.Error as exc:
                 logger.warning("Could not load pre-filter history; continuing with dedup only: %s", exc)
+        _attach_historical_task_signatures(recent_results, config)
+
+        try:
+            _baseline_analyze_ids, baseline_skip_targets, _baseline_dupes = pre_analysis_gate(
+                job_ids,
+                metadata,
+                recent_results,
+                use_history=not no_pre_filter,
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning("Baseline pre-analysis gate failed; analyzing all jobs: %s", exc)
+            _baseline_analyze_ids, baseline_skip_targets = list(job_ids), {}
+
+        context_job_ids = [
+            job_id for job_id in job_ids if job_id not in baseline_skip_targets
+        ]
+        logger.info(
+            "[STEP 1a] Fetching task contexts for %d unresolved job(s)",
+            len(context_job_ids),
+        )
+        task_contexts, job_log_paths = _load_pre_analysis_contexts(
+            context_job_ids, config, pool
+        )
 
         try:
             analyze_ids, skip_targets, dupes = pre_analysis_gate(
@@ -1428,6 +1553,7 @@ def run_batch(
                 metadata,
                 recent_results,
                 use_history=not no_pre_filter,
+                task_contexts=task_contexts,
             )
         except (ValueError, KeyError, TypeError) as exc:
             logger.warning("Pre-analysis gate failed; analyzing all jobs: %s", exc)
@@ -1507,7 +1633,14 @@ def run_batch(
             _enable_mlflow_tracing(config)
             agent_spawn = _utc_now().isoformat().replace("+00:00", "Z")
             executions = asyncio.run(
-                _analyze_jobs(analyze_ids, config, pool, cwd=working_dir, dry_run=dry_run)
+                _analyze_jobs(
+                    analyze_ids,
+                    config,
+                    pool,
+                    cwd=working_dir,
+                    dry_run=dry_run,
+                    job_log_paths=job_log_paths,
+                )
             )
             executions, dupes = _recover_failed_representatives(
                 executions,
@@ -1517,6 +1650,7 @@ def run_batch(
                 pool,
                 cwd=working_dir,
                 dry_run=dry_run,
+                job_log_paths=job_log_paths,
             )
             report_summaries, cross_patterns, aggregation_result = _run_agent_batch(
                 executions,

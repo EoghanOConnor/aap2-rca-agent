@@ -5,6 +5,18 @@ from io import StringIO
 from unittest.mock import Mock
 
 from rca.batch import pre_filter_jobs
+from rca.batch.task_signature import TaskSignature
+
+
+def _signature(error_message: str = "Connection reset by peer") -> TaskSignature:
+    return TaskSignature(
+        play="Setup",
+        role="common",
+        task="Install dependencies",
+        task_action="yum",
+        task_path="/roles/common/tasks/main.yml",
+        error_message=error_message,
+    )
 
 
 def test_pre_matched_entries_formats_and_preserves_input_order() -> None:
@@ -46,6 +58,18 @@ def test_pre_matched_entries_formats_and_preserves_input_order() -> None:
 def test_pre_matched_entries_returns_empty_when_nothing_is_skipped() -> None:
     assert pre_filter_jobs.pre_matched_entries({}, [], [13, 11, 12]) == []
 
+
+def test_job_signal_accepts_a_signature_without_job_metadata() -> None:
+    signal = pre_filter_jobs._job_signal(
+        None,
+        {"failed_tasks": [_signature().__dict__]},
+    )
+
+    assert signal is not None
+    assert signal.catalog_item is None
+    assert signal.text == "Connection reset by peer"
+    assert signal.task_signature == _signature()
+
 def test_pre_analysis_gate_clusters_duplicates_and_preserves_ambiguity_guard() -> None:
     job_metadata = {
         20: {
@@ -83,6 +107,42 @@ def test_pre_analysis_gate_clusters_duplicates_and_preserves_ambiguity_guard() -
     assert dupes == [{"job_id": 21, "representative_job_id": 20}]
 
 
+def test_pre_analysis_gate_preserves_ambiguous_catalog_guard_with_partial_signatures() -> None:
+    job_metadata = {
+        20: {
+            "job_name": "RHPDS platform.widget.dev-20-create",
+            "error_message": "Connection reset by peer",
+        }
+    }
+    historical = [
+        {
+            "id": 90,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "canonical_result_id": 90,
+            "error_message": "Connection reset by peer",
+            "task_signature": _signature(),
+        },
+        {
+            "id": 91,
+            "catalog_item": "widget",
+            "root_cause_category": "configuration",
+            "canonical_result_id": 91,
+            "error_message": "Connection reset by peer",
+        },
+    ]
+
+    analyze_ids, skip_targets, dupes = pre_filter_jobs.pre_analysis_gate(
+        [20],
+        job_metadata,
+        historical,
+    )
+
+    assert analyze_ids == [20]
+    assert skip_targets == {}
+    assert dupes == []
+
+
 def test_pre_analysis_gate_does_not_cluster_generic_errors_across_catalogs() -> None:
     job_metadata = {
         20: {
@@ -102,6 +162,114 @@ def test_pre_analysis_gate_does_not_cluster_generic_errors_across_catalogs() -> 
     )
 
     assert analyze_ids == [20, 21]
+    assert dupes == []
+
+
+def test_pre_analysis_gate_clusters_same_task_signature_across_catalogs() -> None:
+    job_metadata = {
+        20: {
+            "job_name": "RHPDS platform.widget.dev-20-create",
+            "error_message": "Connection reset by peer",
+        },
+        21: {
+            "job_name": "RHPDS platform.other.dev-21-create",
+            "error_message": "Connection reset by peer",
+        },
+    }
+    task_contexts = {
+        20: {"failed_tasks": [_signature().__dict__]},
+        21: {"failed_tasks": [_signature().__dict__]},
+    }
+
+    analyze_ids, _skip_targets, dupes = pre_filter_jobs.pre_analysis_gate(
+        [21, 20],
+        job_metadata,
+        [],
+        task_contexts=task_contexts,
+    )
+
+    assert analyze_ids == [20]
+    assert dupes == [{"job_id": 21, "representative_job_id": 20}]
+
+
+def test_pre_analysis_gate_keeps_same_task_with_different_errors_separate() -> None:
+    job_metadata = {
+        20: {"job_name": "RHPDS platform.widget.dev-20-create"},
+        21: {"job_name": "RHPDS platform.widget.dev-21-create"},
+    }
+    task_contexts = {
+        20: {"failed_tasks": [_signature("Connection reset by peer").__dict__]},
+        21: {"failed_tasks": [_signature("Authentication failed").__dict__]},
+    }
+
+    analyze_ids, _skip_targets, dupes = pre_filter_jobs.pre_analysis_gate(
+        [20, 21],
+        job_metadata,
+        [],
+        task_contexts=task_contexts,
+    )
+
+    assert analyze_ids == [20, 21]
+    assert dupes == []
+
+
+def test_pre_analysis_gate_uses_task_signature_for_known_issue_matching() -> None:
+    job_metadata = {20: {"job_name": "RHPDS platform.other.dev-20-create"}}
+    task_contexts = {20: {"failed_tasks": [_signature().__dict__]}}
+    historical = [
+        {
+            "id": 90,
+            "job_id": 10,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "canonical_result_id": 90,
+            "task_signature": _signature(),
+        }
+    ]
+
+    analyze_ids, skip_targets, dupes = pre_filter_jobs.pre_analysis_gate(
+        [20],
+        job_metadata,
+        historical,
+        task_contexts=task_contexts,
+    )
+
+    assert analyze_ids == []
+    assert skip_targets == {20: 90}
+    assert dupes == []
+
+
+def test_pre_analysis_gate_rejects_ambiguous_task_signature_history() -> None:
+    job_metadata = {20: {"job_name": "RHPDS platform.widget.dev-20-create"}}
+    task_contexts = {20: {"failed_tasks": [_signature().__dict__]}}
+    historical = [
+        {
+            "id": 90,
+            "job_id": 10,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "canonical_result_id": 90,
+            "task_signature": _signature(),
+        },
+        {
+            "id": 91,
+            "job_id": 11,
+            "catalog_item": "widget",
+            "root_cause_category": "configuration",
+            "canonical_result_id": 91,
+            "task_signature": _signature(),
+        },
+    ]
+
+    analyze_ids, skip_targets, dupes = pre_filter_jobs.pre_analysis_gate(
+        [20],
+        job_metadata,
+        historical,
+        task_contexts=task_contexts,
+    )
+
+    assert analyze_ids == [20]
+    assert skip_targets == {}
     assert dupes == []
 
 
