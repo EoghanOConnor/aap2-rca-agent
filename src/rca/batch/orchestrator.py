@@ -242,13 +242,14 @@ def _make_sdk_options(
     }
     if include_skill:
         kwargs.update(
-            skills=["root-cause-analysis"],
+            skills=["root-cause-analysis", "provision-cost-estimate"],
             allowed_tools=[
                 "Bash",
                 "Read",
                 "Write",
                 "mcp__github__search_code",
                 "mcp__github__get_file_contents",
+                "mcp__reporting-db-prod__query",
             ],
         )
     else:
@@ -319,7 +320,8 @@ Skill({{skill: 'root-cause-analysis', args: '{job_id}'}})
 The Python batch orchestrator has already completed deterministic Steps 1–4
 and saved their artifacts in `{artifacts.analysis_dir}`. Do not rerun those
 steps, fetch the job log again, or overwrite their files. Follow the Skill's
-Step 5 analysis guidance using the existing artifacts, and write the summary to
+Step 5a (cost estimate) and Step 5 analysis guidance using the existing
+artifacts, and write the summary to
 `{artifacts.analysis_dir / 'step5_analysis_summary.json'}`. After writing the
 summary, stop and briefly report whether it was written. Do not run the Skill's
 upload command: the Python orchestrator will perform and verify the required

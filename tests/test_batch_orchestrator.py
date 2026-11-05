@@ -156,7 +156,11 @@ def test_sdk_result_usage_and_semaphore_limit(
     assert results[0].text == "completed job 0"
     assert results[0].structured_output == {"ok": True}
     assert results[0].session_id == "session-test"
-    assert all(item["skills"] == ["root-cause-analysis"] for item in option_values)
+    assert all(
+        item["skills"] == ["root-cause-analysis", "provision-cost-estimate"]
+        for item in option_values
+    )
+    assert all("mcp__reporting-db-prod__query" in item["allowed_tools"] for item in option_values)
 
 
 def test_job_failures_are_isolated_from_other_jobs(

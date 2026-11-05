@@ -5,8 +5,10 @@ allowed-tools:
   - Bash
   - Read
   - Write
+  - Skill
   - mcp__github__search_code
   - mcp__github__get_file_contents
+  - mcp__reporting-db-prod__query
 ---
 
 # Root Cause Analysis
@@ -156,6 +158,24 @@ python3 -m venv .venv
 
 ---
 
+## Step 5a: Estimate Cost of the Failure
+
+Run this before writing the summary. It adds an estimated cost for the failed provision. In batch runs, Steps 1-4 are already done by the orchestrator; this step still belongs to you.
+
+1. Get the provision UUID from `step1_job_context.json`. It is the trailing UUID in `job_name`, e.g. `RHPDS agd-v2.ocp-cluster-cnv-pools.prod-7w7z9-provision-74mbq f4e0c93d-f21d-5c66-9ce7-4ad6b44a59a8` -> `f4e0c93d-f21d-5c66-9ce7-4ad6b44a59a8`. Do not use the other UUIDs in the log; those are Ansible event IDs. Do not look the provision up by job ID: job IDs are reused across AAP controllers.
+2. Invoke the `provision-cost-estimate` skill with that UUID.
+3. Keep from its output: estimated cost (low / mid / high), hours failing, median cost per hour, number of comparable provisions, window used, and confidence.
+
+**This step must never block the analysis.** If any of the following happens, do not retry and do not invent a number. Record `estimated_cost.status = "unavailable"` with a short `reason` and continue to Step 5:
+- no UUID in `job_name`
+- the UUID is not found in the reporting database
+- the reporting database or its MCP server is unavailable
+- no comparable provisions exist
+
+The estimate is not billed cost. Keep it labeled as an estimate everywhere it appears.
+
+---
+
 ## Step 5: Analyze and Generate Summary (Claude's task)
 
 **Input**: Read the following files in order:
@@ -199,6 +219,8 @@ python scripts/cli.py upload --job-id <job-id>
    - **Include `github_path`** in recommendations when referencing GitHub files (format: `owner/repo:path/to/file.yml:line`)
    - **Include `evidence_ref`** pointing at the evidence entry the recommendation addresses
    - **Optionally include `fix`** when you can state the exact change as a unified diff against a file you already fetched in step4: `{"status": "proposed", "base_sha": "<the fetched file's sha from step4_github_fetch_history.json>", "diff": "<unified diff>", "pr_link": null}`. `status` is always `"proposed"` — this is a model-authored, untested suggestion, not a verified fix. Never set `fix` without both `status` and `base_sha`; set it to `null` (or omit it) when you don't have a concrete patch.
+
+5. **Estimated Cost**: From Step 5a. Include the `estimated_cost` object as a top-level property of the summary, in the shape shown in the example below (`summary.schema.json` does not define it and does not forbid extra top-level properties). If Step 5a could not produce an estimate, include it with `status: "unavailable"` and a `reason`.
 
 **Note**: Job details, failed tasks, and configuration data are available in step1 and step4 files - reference them rather than duplicating in the summary.
 
@@ -278,7 +300,17 @@ See `schemas/summary.schema.json` for complete structure. Example:
         "pr_link": null
       }
     }
-  ]
+  ],
+  "estimated_cost": {
+    "status": "estimated",
+    "provision_uuid": "f4e0c93d-f21d-5c66-9ce7-4ad6b44a59a8",
+    "hours_failing": 0.82,
+    "cost_per_hour": {"low": 0.27, "median": 1.54, "high": 1.54},
+    "estimated_usd": {"low": 0.22, "mid": 1.26, "high": 1.26},
+    "comparables": {"count": 14, "window_days": 7},
+    "confidence": "high",
+    "note": "Estimate from similar provisions, not billed cost"
+  }
 }
 ```
 
