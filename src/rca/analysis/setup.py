@@ -206,6 +206,63 @@ def check_ssh() -> dict:
     }
 
 
+PROBE_TIMEOUT_SECONDS = 10
+
+
+def _probe_splunk(
+    host: str, username: str, password: str, token: str, has_basic: bool
+) -> str | None:
+    """Make one authenticated Splunk call. Returns an error string, or None on success."""
+    import requests
+
+    kwargs: dict = {}
+    if has_basic:
+        kwargs["auth"] = (username, password)
+    else:
+        kwargs["headers"] = {"Authorization": f"Bearer {token}"}
+    verify = os.environ.get("SPLUNK_VERIFY_SSL", "false").strip().lower() == "true"
+    try:
+        resp = requests.get(
+            f"{host.rstrip('/')}/services/server/info",
+            params={"output_mode": "json"},
+            timeout=PROBE_TIMEOUT_SECONDS,
+            verify=verify,
+            **kwargs,
+        )
+    except requests.RequestException as exc:
+        return f"connection failed ({type(exc).__name__})"
+    if resp.status_code in (401, 403):
+        return f"credentials rejected (HTTP {resp.status_code})"
+    if resp.status_code != 200:
+        return f"unexpected HTTP {resp.status_code}"
+    return None
+
+
+def _probe_github(token: str) -> tuple[str | None, str]:
+    """Call GET /user with the token. Returns (error, login)."""
+    import requests
+
+    try:
+        resp = requests.get(
+            "https://api.github.com/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        return f"connection failed ({type(exc).__name__})", ""
+    if resp.status_code in (401, 403):
+        return f"token rejected (HTTP {resp.status_code})", ""
+    if resp.status_code != 200:
+        return f"unexpected HTTP {resp.status_code}", ""
+    try:
+        return None, str(resp.json().get("login", "unknown"))
+    except ValueError:
+        return None, "unknown"
+
+
 def check_splunk() -> dict:
     """Check Splunk configuration."""
     host = os.environ.get("SPLUNK_HOST", "")
@@ -250,10 +307,17 @@ def check_splunk() -> dict:
         }
 
     auth_method = "basic" if has_basic else "token"
+    probe_error = _probe_splunk(host, username, password, token, has_basic)
+    if probe_error:
+        return {
+            "name": "Splunk",
+            "status": "error",
+            "message": f"host={host}, auth={auth_method}: {probe_error}",
+        }
     return {
         "name": "Splunk",
         "status": "ok",
-        "message": f"host={host}, auth={auth_method}",
+        "message": f"host={host}, auth={auth_method} (authenticated)",
     }
 
 
@@ -274,7 +338,14 @@ def check_github() -> dict:
             "configurable": True,
         }
 
-    return {"name": "GitHub token", "status": "ok", "message": "configured"}
+    probe_error, login = _probe_github(token)
+    if probe_error:
+        return {"name": "GitHub token", "status": "error", "message": probe_error}
+    return {
+        "name": "GitHub token",
+        "status": "ok",
+        "message": f"authenticated as {login}",
+    }
 
 
 def check_github_mcp(repo_root: Path) -> dict:
