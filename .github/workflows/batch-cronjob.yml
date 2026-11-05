@@ -44,9 +44,13 @@ jobs:
       # In pull_request_target context the default checkout would use the PR's
       # base branch; explicitly check out the PR head so the PR's code is what
       # gets tested. Falls back to the event's own SHA on push/dispatch.
+      # allow-unsafe-pr-checkout is an explicit opt-in: the job-level
+      # safe-to-test label gate above is the control that makes this safe.
+      # See https://gh.io/securely-using-pull_request_target
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          allow-unsafe-pr-checkout: true
 
       # CI config (ci/ci.env), cluster access, namespace, images and oc. The
       # ci.env values, NS/IMAGE/SSHD_IMAGE (GITHUB_ENV) and oc (GITHUB_PATH)
