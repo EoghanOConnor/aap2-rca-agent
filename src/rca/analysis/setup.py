@@ -207,20 +207,25 @@ def check_ssh() -> dict:
 
 
 PROBE_TIMEOUT_SECONDS = 10
+_REQUESTS_MISSING = "cannot test connection: 'requests' is not installed (see Python dependencies)"
 
 
 def _probe_splunk(
     host: str, username: str, password: str, token: str, has_basic: bool
 ) -> str | None:
     """Make one authenticated Splunk call. Returns an error string, or None on success."""
-    import requests
+    try:
+        import requests
+    except ImportError:
+        return _REQUESTS_MISSING
 
     kwargs: dict = {}
     if has_basic:
         kwargs["auth"] = (username, password)
     else:
         kwargs["headers"] = {"Authorization": f"Bearer {token}"}
-    verify = os.environ.get("SPLUNK_VERIFY_SSL", "false").strip().lower() == "true"
+    # Same parsing as Config.from_env (no strip) so the probe verifies like runtime.
+    verify = os.environ.get("SPLUNK_VERIFY_SSL", "false").lower() == "true"
     try:
         resp = requests.get(
             f"{host.rstrip('/')}/services/server/info",
@@ -240,7 +245,10 @@ def _probe_splunk(
 
 def _probe_github(token: str) -> tuple[str | None, str]:
     """Call GET /user with the token. Returns (error, login)."""
-    import requests
+    try:
+        import requests
+    except ImportError:
+        return _REQUESTS_MISSING, ""
 
     try:
         resp = requests.get(

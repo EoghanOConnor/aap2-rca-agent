@@ -1,8 +1,12 @@
 """Preflight checks must test live connectivity, not only that settings exist."""
 
+import os
+
+import pytest
 import requests
 
 from rca.analysis import setup
+from rca.config import Config
 
 
 class FakeResponse:
@@ -95,3 +99,50 @@ def test_missing_config_does_not_probe(monkeypatch):
     monkeypatch.setattr(requests, "get", fail)
     assert setup.check_github()["status"] == "missing"
     assert setup.check_splunk()["status"] == "missing"
+
+
+def test_probes_degrade_when_requests_is_unavailable(monkeypatch):
+    import sys
+
+    _splunk_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_example")
+    monkeypatch.setitem(sys.modules, "requests", None)  # `import requests` raises ImportError
+
+    splunk = setup.check_splunk()
+    github = setup.check_github()
+    assert splunk["status"] == "error"
+    assert github["status"] == "error"
+    assert "requests" in splunk["message"]
+    assert "requests" in github["message"]
+
+
+def test_run_checks_completes_when_requests_is_unavailable(monkeypatch, tmp_path):
+    import sys
+
+    _splunk_env(monkeypatch)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_example")
+    monkeypatch.setitem(sys.modules, "requests", None)
+    stub = lambda *a, **k: {"name": "stub", "status": "ok", "message": ""}  # noqa: E731
+    for name in (
+        "check_python_venv", "check_job_logs_dir", "check_jumpbox", "check_ssh",
+        "check_github_mcp", "check_mlflow", "check_mlflow_server", "check_mlflow_hooks",
+    ):
+        monkeypatch.setattr(setup, name, stub)
+
+    results = setup.run_checks(tmp_path, repo_root=tmp_path)
+    by_name = {r["name"]: r for r in results}
+    assert by_name["Splunk"]["status"] == "error"
+    assert by_name["GitHub token"]["status"] == "error"
+
+
+@pytest.mark.parametrize("raw", ["true", "TRUE", "false", " true ", "true\n", "yes", ""])
+def test_splunk_ssl_verify_matches_runtime_config(monkeypatch, raw):
+    _splunk_env(monkeypatch)
+    monkeypatch.setenv("SPLUNK_VERIFY_SSL", raw)
+    seen = {}
+    monkeypatch.setattr(
+        requests, "get", lambda url, **kw: seen.update(kw) or FakeResponse(200)
+    )
+    setup.check_splunk()
+    runtime = Config.from_env(environment=dict(os.environ)).splunk.verify_ssl
+    assert seen["verify"] is runtime
