@@ -50,6 +50,94 @@ def test_store_report_reads_mapping_insert_result() -> None:
     connection.commit.assert_called_once_with()
 
 
+def test_store_report_populates_legacy_recommendation_column(tmp_path) -> None:
+    connection, cursor = _connection_and_cursor()
+    cursor.fetchone.return_value = {"id": 55}
+    analysis_dir = tmp_path / ".analysis" / "123"
+    analysis_dir.mkdir(parents=True)
+    (analysis_dir / "step5_analysis_summary.json").write_text(
+        json.dumps(
+            {
+                "recommendations": [
+                    {
+                        "priority": "high",
+                        "action": "fix it",
+                        "github_path": "o/r:f.yml",
+                        "details": "d",
+                    }
+                ]
+            }
+        )
+    )
+
+    assert store_report.store_report(
+        connection,
+        {"results_table": "results", "source_table": "events"},
+        {
+            "batch_id": "batch_test",
+            "job_summaries": [
+                {
+                    "job_id": "123",
+                    "status": "analyzed",
+                    "analysis_path": str(analysis_dir),
+                }
+            ],
+        },
+    )
+
+    insert_call = cursor.execute.call_args_list[0]
+    assert "recommendation" in str(insert_call.args[0])
+    recommendation = insert_call.args[1][-1]
+    assert recommendation.adapted == [
+        {
+            "priority": "high",
+            "action": "fix it",
+            "github_path": "o/r:f.yml",
+            "details": "d",
+            "evidence_ref": None,
+            "fix": None,
+        }
+    ]
+
+
+def test_store_report_persists_standalone_result_columns() -> None:
+    connection, cursor = _connection_and_cursor()
+    cursor.fetchone.return_value = {"id": 55}
+
+    assert store_report.store_report(
+        connection,
+        {"results_table": "results", "source_table": "events"},
+        {
+            "batch_id": "batch_test",
+            "job_summaries": [
+                {
+                    "job_id": "123",
+                    "status": "analyzed",
+                    "root_cause_category": "infrastructure",
+                    "root_cause_summary": "A worker ran out of capacity",
+                    "confidence": "high",
+                    "related_result_id": "42",
+                    "related_result_confidence": "medium",
+                }
+            ],
+        },
+    )
+
+    insert_call = cursor.execute.call_args_list[0]
+    insert_sql = str(insert_call.args[0])
+    for column in (
+        "root_cause_category",
+        "confidence",
+        "related_result_id",
+        "related_result_confidence",
+    ):
+        assert column in insert_sql
+    assert insert_call.args[1][3] == "infrastructure"
+    assert insert_call.args[1][5] == "high"
+    assert insert_call.args[1][8] == 42
+    assert insert_call.args[1][9] == "medium"
+
+
 def test_link_intra_batch_dupes_reads_mapping_result_row() -> None:
     connection, cursor = _connection_and_cursor()
     cursor.fetchone.return_value = {"aap2_job_results_fk_id": 91}
@@ -415,6 +503,8 @@ def test_post_analysis_link_updates_a_null_anchor_historical_row() -> None:
     )
     assert (50, "123") in update_params
     assert report["job_summaries"][0]["historical_matches"][0]["pattern_id"] == "50"
+    assert report["job_summaries"][0]["related_result_id"] == 50
+    assert report["job_summaries"][0]["related_result_confidence"] == "high"
 
 
 def test_post_analysis_link_does_not_claim_a_missing_result() -> None:

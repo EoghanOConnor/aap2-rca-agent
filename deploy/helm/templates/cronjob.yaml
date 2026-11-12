@@ -63,11 +63,6 @@ spec:
               cp /tmp/gcp-creds/application_default_credentials.json /workspace/.config/gcloud/application_default_credentials.json
               {{- end }}
 
-              echo "[INIT] Installing root-cause-analysis Skill..."
-              mkdir -p /workspace/.claude/skills
-              rsync -a --exclude='.analysis' --exclude='__pycache__' --exclude='*.pyc' --exclude='tests' --exclude='README.md' \
-                /opt/app/skills/ /workspace/.claude/skills/
-              echo "[INIT] Skills installed: $(ls /workspace/.claude/skills/ | tr '\n' ' ')"
             volumeMounts:
             - name: workspace
               mountPath: /workspace

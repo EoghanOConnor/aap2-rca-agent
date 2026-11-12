@@ -18,6 +18,7 @@ CREATE TABLE aap2_job_results (
     -- { summary, platform, failing_role, failing_github_path, analysis_path,
     --   evidence[], causal_chain[], misidentifications[], recommendations[] }
     root_cause                     JSONB,
+    recommendation                 JSONB,
 
     -- Relationship to the canonical result row for the same issue cluster.
     -- The anchor row is NULL; every other member points directly to it.
@@ -58,6 +59,10 @@ CREATE INDEX aap2_job_results_related_result_id_idx
 -- Not added: cross_job_pattern_github_path. A shared offending file is just a
 -- 'related_job' evidence entry's github_path.
 --
+-- recommendation is a legacy compatibility column. It mirrors
+-- root_cause->recommendations for consumers that still read the standalone
+-- recommendation field.
+--
 -- Not columns: platform, failing_role, failing_github_path, analysis_path.
 -- These live inside root_cause.
 
@@ -66,6 +71,7 @@ CREATE INDEX aap2_job_results_related_result_id_idx
 -- only for a fresh database):
 --
 -- ALTER TABLE aap2_job_results ADD COLUMN IF NOT EXISTS root_cause JSONB;
+-- ALTER TABLE aap2_job_results ADD COLUMN IF NOT EXISTS recommendation JSONB;
 -- ALTER TABLE aap2_job_results
 --     ADD COLUMN IF NOT EXISTS related_result_id
 --         INTEGER REFERENCES aap2_job_results(id);

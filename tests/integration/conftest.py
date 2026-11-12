@@ -31,6 +31,7 @@ CREATE TABLE {RESULTS_TABLE} (
     catalog_item TEXT,
     root_cause_category TEXT,
     root_cause JSONB,
+    recommendation JSONB,
     related_result_id INTEGER REFERENCES aap2_job_results(id),
     related_result_confidence TEXT
         CHECK (related_result_confidence IN ('high', 'medium', 'low')),

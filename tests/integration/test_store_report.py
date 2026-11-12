@@ -70,20 +70,21 @@ def test_store_report_persists_root_cause(db, tmp_path) -> None:
 
     with db.cursor() as cur:
         cur.execute(
-            f"SELECT root_cause, root_cause_category FROM {RESULTS_TABLE}"
+            f"SELECT root_cause, root_cause_category, recommendation FROM {RESULTS_TABLE}"
             " WHERE batch_id = %s AND job_id = %s",
             ("batch_test_store_report", 21),
         )
         row = cur.fetchone()
 
     assert row is not None
-    root_cause, category = row
+    root_cause, category, recommendation = row
     assert category == "cloud_api"
     assert root_cause["summary"] == "AWS throttled RunInstances"
     assert root_cause["evidence"][0]["job_id"] == "21"
     assert root_cause["causal_chain"][0]["relationship"] == "direct_cause"
     assert root_cause["misidentifications"] == []
     assert root_cause["recommendations"] == []
+    assert recommendation == []
 
 
 def test_store_report_upserts_on_conflict(db) -> None:
@@ -155,7 +156,8 @@ def test_post_analysis_link_persists_related_result(db) -> None:
 
     with db.cursor() as cur:
         cur.execute(
-            f"SELECT id, related_result_id, related_result_confidence"
+            f"SELECT id, confidence, root_cause_category,"
+            f" related_result_id, related_result_confidence"
             f" FROM {RESULTS_TABLE} ORDER BY id"
         )
         rows = cur.fetchall()
@@ -164,13 +166,18 @@ def test_post_analysis_link_persists_related_result(db) -> None:
         )
         (source_fk_id,) = cur.fetchone()
 
-    assert rows[0] == (historical_result_id, None, None)
+    assert rows[0] == (historical_result_id, "high", "infrastructure", None, None)
     assert rows[1] == (
         current_report["job_summaries"][0]["result_id"],
+        "high",
+        "infrastructure",
         historical_result_id,
         "high",
     )
     assert source_fk_id == historical_result_id
+    current_summary = current_report["job_summaries"][0]
+    assert current_summary["related_result_id"] == historical_result_id
+    assert current_summary["related_result_confidence"] == "high"
 
 
 def test_post_analysis_link_merges_clusters_without_orphaned_anchors(db) -> None:

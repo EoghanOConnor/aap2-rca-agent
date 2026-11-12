@@ -1,53 +1,45 @@
 #!/bin/bash
 set -euo pipefail
 
-POD_NAME="${POD_NAME:-claude-rca-eval}"
-REPO_URL="${REPO_URL:-https://github.com/redhat-et/rhdp-rca-plugin.git}"
-BRANCH="${BRANCH:-main}"
-
-ALLOWED_TOOLS=(
-  "Bash(python3*)" "Bash(python3 *)"
-  "Bash(.venv/bin/python *)" "Bash(.venv/bin/pip *)"
-  "Bash(mkdir *)" "Bash(mkdir -p *)"
-  "Bash(cp *)" "Bash(ls *)" "Bash(cat *)"
-  "Bash(ssh *)" "Bash(rsync *)" "Bash(chmod *)"
-  "Bash(gzip *)" "Bash(gunzip *)"
-  "Bash(head *)" "Bash(tail *)" "Bash(wc *)"
-  "Bash(find *)" "Bash(grep *)" "Bash(jq *)"
-  "Read" "Write" "Glob" "Grep"
-)
+POD_NAME="${POD_NAME:-rhdp-rca-plugin-eval}"
 
 usage() {
-  echo "Usage: $0 <prompt>"
-  echo ""
-  echo "Run a Claude Code prompt inside the OpenShift eval pod."
-  echo ""
-  echo "Examples:"
-  echo "  $0 'Investigate why job <JOB_ID> failed'"
-  echo "  $0 'Analyze the root cause of the failure in extracted_log/job_<JOB_ID>.json.gz.transform-processed'"
-  echo ""
-  echo "Environment variables:"
-  echo "  POD_NAME   Pod name (default: claude-rca-eval)"
-  echo "  REPO_URL   Git repo to clone (default: redhat-et/rhdp-rca-plugin)"
-  echo "  BRANCH     Branch to checkout (default: main)"
+  cat <<EOF
+Usage: $0 <job-id>
+
+Run the installed single-job RCA entry point inside the OpenShift eval pod.
+The eval pod uses the same image, settings, and SSH configuration as the CronJob.
+
+Environment variables:
+  POD_NAME       Eval pod name (default: rhdp-rca-plugin-eval)
+  JOB_LOGS_DIR   Optional in-pod override used to exercise preflight behavior
+EOF
   exit 1
 }
 
-if [ $# -eq 0 ]; then
+if [[ $# -ne 1 ]]; then
   usage
 fi
 
-PROMPT="$1"
+JOB_ID="$1"
+if [[ ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
+  echo "job-id must be numeric" >&2
+  exit 1
+fi
 
 echo "==> Checking pod status..."
 oc wait "pod/${POD_NAME}" --for=condition=Ready --timeout=60s
 
-echo "==> Cloning repo (branch: ${BRANCH})..."
-oc exec "${POD_NAME}" -- bash -c \
-  "rm -rf /workspace/rhdp-rca-plugin && git clone --branch ${BRANCH} ${REPO_URL} /workspace/rhdp-rca-plugin"
+echo "==> Running rca-analyze for job ${JOB_ID}..."
+REMOTE_COMMAND=(rca-analyze analyze --job-id "${JOB_ID}" --fetch)
+REMOTE_ENV=(env)
+if [[ -n "${JOB_LOGS_DIR:-}" ]]; then
+  REMOTE_ENV+=("JOB_LOGS_DIR=${JOB_LOGS_DIR}")
+fi
 
-echo "==> Running eval..."
-oc exec "${POD_NAME}" -- bash -c \
-  "cd /workspace/rhdp-rca-plugin && claude -p '${PROMPT}' \
-    --allowedTools $(printf '"%s" ' "${ALLOWED_TOOLS[@]}") \
-    --output-format json"
+oc exec "${POD_NAME}" -- "${REMOTE_ENV[@]}" bash -c '
+  DB_REMOTE_HOST=$(cat /tmp/ssh-secret/db-remote-host)
+  DB_REMOTE_PORT=$(cat /tmp/ssh-secret/db-remote-port)
+  ssh -f -N -L "15432:${DB_REMOTE_HOST}:${DB_REMOTE_PORT}" aap2-bastion
+  exec "$@"
+' bash "${REMOTE_COMMAND[@]}"

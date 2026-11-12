@@ -1,8 +1,8 @@
 # Contributing
 
 Thanks for improving the AAP RCA agent. Python source code lives in the
-installable `src/rca` package; the shell batch coordinator and on-disk Skill
-remain in place while their runtime replacement is handled separately.
+installable `src/rca` package; the shell batch entry point remains only as a
+compatibility wrapper.
 
 ## Development
 
@@ -20,7 +20,9 @@ The PostgreSQL integration tests can be run with
 - Add runtime and development dependencies to `pyproject.toml`.
 - Keep Python imports within `rca.*`; do not add `sys.path` or `PYTHONPATH`
   workarounds.
-- Put reusable Python code in `src/rca/`. Load packaged schemas with
+- Put reusable Python code in `src/rca/`. Define JSON artifact contracts in
+  `rca.models` and generate API schemas with `model_json_schema()`; do not
+  maintain separate JSON schema files. Load packaged prompts with
   `importlib.resources`.
 - If Helm behavior changes, update `deploy/helm/values.example.yaml` and the
   deployment documentation.

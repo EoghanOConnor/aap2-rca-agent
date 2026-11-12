@@ -1,0 +1,52 @@
+flowchart TD
+    A["run_batch()"] --> B["pre_analysis_gate()
+(score_similarity 'pre_analysis')"]
+
+    B -->|cluster dupes| C{"skip_targets?
+high-confidence match"}
+    C -->|yes| D["store_pre_matched()"]
+    C -->|no| E["_analyze_jobs()
+fetch logs, run deterministic Steps 1-4,
+Step 5 Agent SDK structured summary,
+verified upload"]
+
+    E -->|fails| F["_recover_failed_representatives()
+retry duplicates"]
+    F -->|success| E
+    E -->|complete| G["_run_agent_batch()
+LLM _aggregate_semantics()
+(falls back to deterministic
+matching on failure/no match)"]
+
+    G --> H["_build_report() / _write_report()
+validate & write JSON"]
+
+    H --> I["_store_batch_report()
+begin transaction"]
+
+    subgraph TXN["One Transaction"]
+        direction TB
+        J["1. store_report()"]
+        K["2. post_analysis_link()
+score pairs, _assign_clusters()"]
+        M["3. link_intra_batch_dupes()"]
+        J --> K --> M
+    end
+
+    I --> J
+    M --> Z["conn.commit()"]
+
+    subgraph DB["Postgres"]
+        S[("aap2_events
+aap2_job_results_fk_id")]
+        R[("aap2_job_results
+root_cause, pattern_id")]
+    end
+
+    D -.->|"UPDATE FK"| S
+    J -.->|"INSERT"| R
+    J -.->|"UPDATE FK"| S
+    K -.->|"UPDATE"| R
+    M -.->|"UPDATE FK"| S
+    Z ==>|"commit"| S
+    Z ==>|"commit"| R

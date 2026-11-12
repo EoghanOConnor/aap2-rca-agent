@@ -1,3 +1,4 @@
+{{- if ne (dig "buildconfig" "enabled" true .Values.AsMap) false }}
 apiVersion: build.openshift.io/v1
 kind: BuildConfig
 metadata:
@@ -24,3 +25,4 @@ spec:
       github:
         secretReference:
           name: {{ .Values.secrets.names.webhookSecret }}
+{{- end }}

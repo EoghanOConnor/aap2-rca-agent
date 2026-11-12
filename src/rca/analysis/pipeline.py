@@ -124,6 +124,30 @@ def _resolve_job_log(
     return path, job_id
 
 
+def load_job_context(
+    *,
+    config: Config,
+    job_id: str | None = None,
+    job_log: str | Path | None = None,
+    fetch: bool = False,
+    db_pool: Any | None = None,
+) -> tuple[Path, str | None, dict[str, Any]]:
+    """Resolve a job log and parse its step-one context."""
+
+    path, requested_job_id = _resolve_job_log(
+        config=config,
+        job_id=job_id,
+        job_log=job_log,
+        fetch=fetch,
+        db_pool=db_pool,
+    )
+    try:
+        context = parse_job_log(path)
+    except Exception as exc:
+        raise AnalysisPipelineError(f"Could not parse job log {path}: {exc}") from exc
+    return path, requested_job_id, context
+
+
 def run_analysis(
     *,
     config: Config,
@@ -133,17 +157,13 @@ def run_analysis(
     db_pool: Any | None = None,
 ) -> AnalysisArtifacts:
     """Run steps 1–4 and return their artifacts for the caller."""
-    job_log_path, requested_job_id = _resolve_job_log(
+    job_log_path, requested_job_id, job_context = load_job_context(
         config=config,
         job_id=job_id,
         job_log=job_log,
         fetch=fetch,
         db_pool=db_pool,
     )
-    try:
-        job_context = parse_job_log(job_log_path)
-    except Exception as exc:
-        raise AnalysisPipelineError(f"Could not parse job log {job_log_path}: {exc}") from exc
 
     parsed_job_id = str(requested_job_id or job_context.get("job_id") or "unknown")
     analysis_dir = config.analysis_dir / parsed_job_id
@@ -169,6 +189,8 @@ def run_analysis(
                 "ocp_logs": [],
                 "error_logs": [],
                 "pods_found": [],
+                "skipped": True,
+                "reason": f"Splunk is unavailable: {exc}",
                 "errors": [str(exc)],
             }
     save_step(analysis_dir, 2, splunk_logs)

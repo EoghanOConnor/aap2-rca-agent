@@ -1,0 +1,39 @@
+flowchart TD
+    SourceDB[(Source DB)] --> Jobs([Unanalyzed jobs])
+    ResultsDB[(Results DB)] --> Recent([Recent active high-confidence issues from the past 4 hours])
+
+    subgraph Gate["Pre-analysis gate"]
+        direction TB
+        JobContext["Load job log and source metadata
+job_name + error_message"]
+        FailedTask["Extract first failed task
+play, role, task, action, path, error"]
+        Signature["Build normalized task signature
+fallback: catalog item + error_message"]
+        Duplicate{"Same task signature and
+similar, specific error?"}
+        Group["Group duplicate jobs
+under one representative"]
+        Keep["Keep job separate"]
+        Known{"Known, unambiguous issue
+for this task signature?"}
+        Skip["Link to known issue
+and skip full analysis"]
+        Analyze["Analyze representative job"]
+    end
+
+    Jobs --> JobContext
+    JobContext --> FailedTask
+    FailedTask --> Signature
+    Signature --> Duplicate
+    Duplicate -- Yes --> Group
+    Duplicate -- No --> Keep
+    Group --> Known
+    Keep --> Known
+    Recent --> Known
+    Known -- Yes --> Skip
+    Known -- No --> Analyze
+
+    Skip --> KnownLinks([Known-issue links])
+    Analyze --> ToAnalysis([Representatives for rca-agent to analyze])
+    Group --> DuplicateLinks([Duplicate links])

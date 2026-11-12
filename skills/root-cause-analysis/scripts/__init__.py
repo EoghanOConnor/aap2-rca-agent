@@ -1,1 +1,0 @@
-# Splunk Log Analysis Scripts

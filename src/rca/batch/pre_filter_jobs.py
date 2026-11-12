@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -14,6 +15,7 @@ import psycopg2.sql
 from rca.config import load_database_config
 from rca.database import connect_db, known_issue_active_sql
 from rca.batch.match import MatchSignals, score_similarity
+from rca.batch.task_signature import TaskSignature, build_task_signature
 
 
 
@@ -47,8 +49,11 @@ def fetch_recent_results(
     with conn.cursor() as cur:
         cur.execute(
             psycopg2.sql.SQL(
-                """SELECT r.id, r.catalog_item, r.root_cause_category,
-                          r.root_cause->>'summary' AS root_cause_summary, e.error_message
+                """SELECT r.id, r.job_id, r.catalog_item, r.root_cause_category,
+                          r.root_cause->>'summary' AS root_cause_summary,
+                          r.root_cause->>'analysis_path' AS analysis_path,
+                          COALESCE(r.related_result_id, r.id) AS canonical_result_id,
+                          e.error_message
                    FROM {results} r
                    LEFT JOIN {source} e ON r.job_id::text = e.job_id::text
                    WHERE r.confidence = 'high'
@@ -66,20 +71,32 @@ def fetch_recent_results(
         return [dict(row) for row in cur.fetchall()]
 
 
-def _job_signal(meta: dict[str, Any] | None) -> MatchSignals | None:
-    if not meta:
+def _job_signal(
+    meta: dict[str, Any] | None,
+    task_context: Mapping[str, Any] | None = None,
+) -> MatchSignals | None:
+    signature = build_task_signature(task_context)
+    if not meta and signature is None:
         return None
+    text = (meta.get("error_message") if meta else None) or (
+        signature.error_message if signature else None
+    )
+    catalog_item = extract_catalog_item(meta.get("job_name", "")) if meta else None
     return MatchSignals(
-        catalog_item=extract_catalog_item(meta.get("job_name", "")),
-        text=meta.get("error_message"),
+        catalog_item=catalog_item,
+        text=text,
+        task_signature=signature,
     )
 
 
 def _historical_signal(result: dict[str, Any]) -> MatchSignals:
+    signature = result.get("task_signature")
     return MatchSignals(
         catalog_item=result.get("catalog_item"),
-        text=result.get("error_message"),
+        text=result.get("error_message")
+        or (signature.error_message if isinstance(signature, TaskSignature) else None),
         category=result.get("root_cause_category"),
+        task_signature=signature if isinstance(signature, TaskSignature) else None,
     )
 
 
@@ -89,19 +106,26 @@ def pre_analysis_gate(
     historical: list[dict[str, Any]],
     *,
     use_history: bool = True,
+    task_contexts: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> tuple[list[int], dict[int, int], list[dict[str, Any]]]:
     """Cluster incoming jobs and conservatively skip known issues."""
 
     ordered_job_ids = list(dict.fromkeys(job_ids))
     clusters: list[list[int]] = []
     for job_id in sorted(ordered_job_ids):
-        signal = _job_signal(job_metadata.get(job_id))
+        signal = _job_signal(
+            job_metadata.get(job_id),
+            task_contexts.get(job_id) if task_contexts else None,
+        )
         if signal is None:
             clusters.append([job_id])
             continue
 
         for cluster in clusters:
-            representative_signal = _job_signal(job_metadata.get(cluster[0]))
+            representative_signal = _job_signal(
+                job_metadata.get(cluster[0]),
+                task_contexts.get(cluster[0]) if task_contexts else None,
+            )
             if representative_signal is None:
                 continue
             result = score_similarity(signal, representative_signal, "pre_analysis")
@@ -121,6 +145,23 @@ def pre_analysis_gate(
         for catalog_item, results in grouped_by_catalog.items()
         if len({result.get("root_cause_category") for result in results}) > 1
     }
+    signature_groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    for result in historical:
+        signature = result.get("task_signature")
+        if isinstance(signature, TaskSignature) and signature.is_complete:
+            signature_groups.setdefault(signature.identity_key, []).append(result)
+    ambiguous_signatures = {
+        identity
+        for identity, results in signature_groups.items()
+        if len({result.get("root_cause_category") for result in results}) > 1
+        or len(
+            {
+                result.get("canonical_result_id", result.get("id"))
+                for result in results
+            }
+        )
+        > 1
+    }
 
     skip_targets: dict[int, int] = {}
     analyze_ids: list[int] = []
@@ -130,11 +171,21 @@ def pre_analysis_gate(
             analyze_ids.append(representative)
             continue
 
-        representative_signal = _job_signal(job_metadata.get(representative))
+        representative_signal = _job_signal(
+            job_metadata.get(representative),
+            task_contexts.get(representative) if task_contexts else None,
+        )
         best_result: dict[str, Any] | None = None
         best_score = 0.0
         for historical_result in historical:
+            historical_signature = historical_result.get("task_signature")
             if historical_result.get("catalog_item") in ambiguous_catalogs:
+                continue
+            if (
+                isinstance(historical_signature, TaskSignature)
+                and historical_signature.is_complete
+                and historical_signature.identity_key in ambiguous_signatures
+            ):
                 continue
             if representative_signal is None:
                 continue

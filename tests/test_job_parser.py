@@ -1,12 +1,8 @@
 import gzip
 import json
 from pathlib import Path
-from importlib.resources import files
 
-import jsonschema
 import pytest
-
-schemas_path = files("rca").joinpath("schemas")
 
 from rca.analysis.job_parser import (
     _extract_failed_tasks,
@@ -16,19 +12,13 @@ from rca.analysis.job_parser import (
     load_job_log,
     parse_job_log,
 )
+from rca.models import JobContext
 
 
 @pytest.fixture
 def sample_job_data():
     data_path = Path(__file__).parent / "data" / "sample_job.json"
     with open(data_path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-@pytest.fixture
-def job_context_schema():
-    schema_path = schemas_path.joinpath("job_context.schema.json")
-    with open(schema_path) as f:
         return json.load(f)
 
 
@@ -235,16 +225,15 @@ def test_extract_failed_tasks_no_failures():
 # --- parse_job_log (integration) tests ---
 
 
-def test_parse_job_log_integration(tmp_path, sample_job_data, job_context_schema):
-    """End-to-end test: parse file and validate against schema."""
+def test_parse_job_log_integration(tmp_path, sample_job_data):
+    """End-to-end test: parse file and validate the context model."""
     file_path = tmp_path / "job.json"
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(sample_job_data, f)
 
     context = parse_job_log(file_path)
 
-    # Validate against actual JSON schema
-    jsonschema.validate(instance=context, schema=job_context_schema)
+    JobContext.model_validate(context)
 
     # Verify specific fields
     assert context["job_id"] == "12345"

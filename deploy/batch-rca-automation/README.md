@@ -3,13 +3,18 @@
 The OpenShift CronJob runs the installed `rca-batch` Python entry point. The
 orchestrator queries and filters jobs through a shared PostgreSQL connection
 pool, runs deterministic analysis in bounded worker threads, invokes the
-`root-cause-analysis` Skill through the Claude Agent SDK, aggregates and stores
+packaged RCA system prompt through the Claude Agent SDK, aggregates and stores
 the batch report, and logs Agent SDK usage to MLflow when configured.
 
-The on-disk Skill remains the source of the per-job analysis instructions and
-is copied into the workspace by the CronJob init container. Jira ticket
-preparation is currently a no-op placeholder; the batch runner creates no
-Jira tickets.
+Each job uses one SDK query for investigation and its final structured summary.
+The SDK validates the summary against the generated output schema and manages
+structured-output retries. Python saves the successful structured result and
+performs and verifies the analysis upload. SDK errors and missing structured
+results fail the job.
+
+The packaged system prompt is the source of per-job analysis instructions; no
+on-disk Skill is copied into the workspace. Jira ticket preparation is
+currently a no-op placeholder; the batch runner creates no Jira tickets.
 
 `batch_rca_headless.sh` is retained as a compatibility wrapper for existing
 manual/cron invocations and forwards all arguments to `rca-batch`.

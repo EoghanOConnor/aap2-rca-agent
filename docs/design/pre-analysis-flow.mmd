@@ -1,0 +1,36 @@
+flowchart TD
+    SourceDB[(Source DB)] --> Jobs
+    Jobs([Unanalyzed jobs]) --> TaskContext
+    ResultsDB[(Results DB)] --> Recent
+
+    subgraph Gate["Pre-analysis gate"]
+        direction TB
+        Recent["Recent active high-confidence issues
+from the past 4 hours"]
+        TaskContext["Extract failed Ansible task
+play, role, task, action, path, error"]
+        Signature["Build task signature
+fallback: catalog item + error message"]
+        Duplicate{"Same task signature?"}
+        Group["Group duplicate jobs"]
+        Keep["Keep job separate"]
+        Representative["Use one representative job"]
+        Known{"Known, unambiguous issue for this task signature?"}
+        Link["Link job and affected catalog item to existing issue"]
+        New["Analyze representative as a new issue"]
+    end
+
+    TaskContext --> Signature
+    Recent --> Known
+    Signature --> Duplicate
+    Duplicate -- Yes --> Group
+    Duplicate -- No --> Keep
+    Group --> Representative
+    Representative --> Known
+    Keep --> Known
+    Known -- Yes --> Link
+    Known -- No --> New
+
+    Link --> IssueLinks([Issue links and affected catalog items])
+    New --> ToAnalysis([Representatives for rca-agent to analyze])
+    Group --> DuplicateLinks([Duplicate links])

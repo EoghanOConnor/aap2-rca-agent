@@ -8,6 +8,7 @@ import logging
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from importlib.resources import files
@@ -16,41 +17,66 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+import jsonschema
 
 from rca.analysis.pipeline import AnalysisArtifacts
+from rca.analysis import tracing
 from rca.batch import orchestrator
 from rca.config import Config
+from rca.models import AnalysisSummary, BatchSemanticOutput
 
 
-def _config(tmp_path: Path, *, max_parallel_jobs: int = 2) -> Config:
+def _config(
+    tmp_path: Path,
+    *,
+    max_parallel_jobs: int = 2,
+    job_logs_dir: Path | None = None,
+) -> Config:
+    environment = {
+        "RCA_STATE_DIR": str(tmp_path),
+        "RCA_MAX_PARALLEL_JOBS": str(max_parallel_jobs),
+        "SOURCE_DB_NAME": "rca",
+        "SOURCE_DB_USER": "agent",
+        "SOURCE_DB_PASSWORD": "not-a-real-secret",
+        "SOURCE_DB_TABLE": "aap2_events",
+        "SOURCE_DB_RESULT_TABLE": "aap2_job_results",
+        "JUMPBOX_URI": "agent@jumpbox.example.test",
+        "SSH_JUMPBOX_ALIAS": "ci-jumpbox",
+    }
+    if job_logs_dir is not None:
+        environment["JOB_LOGS_DIR"] = str(job_logs_dir)
     return Config.from_env(
-        environment={
-            "RCA_STATE_DIR": str(tmp_path),
-            "RCA_MAX_PARALLEL_JOBS": str(max_parallel_jobs),
-            "SOURCE_DB_NAME": "rca",
-            "SOURCE_DB_USER": "agent",
-            "SOURCE_DB_PASSWORD": "not-a-real-secret",
-            "SOURCE_DB_TABLE": "aap2_events",
-            "SOURCE_DB_RESULT_TABLE": "aap2_job_results",
-            "JUMPBOX_URI": "agent@jumpbox.example.test",
-            "SSH_JUMPBOX_ALIAS": "ci-jumpbox",
-        },
+        environment=environment,
         env_file=tmp_path / "missing.env",
     )
 
 
+def _summary(job_id: str) -> dict[str, object]:
+    return {
+        "job_id": job_id,
+        "analyzed_at": "2026-01-01T00:00:00Z",
+        "root_cause": {
+            "summary": "A test failure",
+            "category": "infrastructure",
+            "confidence": "high",
+        },
+        "correlation": {"method": "test", "identifiers": {}},
+        "evidence": [
+            {
+                "source": "aap_job",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": "A test failure occurred",
+            }
+        ],
+        "causal_chain": [],
+        "misidentifications": [],
+        "recommendations": [],
+    }
+
+
 def _write_summary(analysis_dir: Path) -> None:
     (analysis_dir / "step5_analysis_summary.json").write_text(
-        json.dumps(
-            {
-                "root_cause": {
-                    "summary": "A test failure",
-                    "category": "infrastructure",
-                    "confidence": "high",
-                }
-            }
-        ),
-        encoding="utf-8",
+        json.dumps(_summary(analysis_dir.name)), encoding="utf-8"
     )
 
 
@@ -74,12 +100,346 @@ def test_main_parses_batch_options_and_calls_python_orchestrator(
         since="2026-10-01 10:00:00",
         limit=7,
         no_pre_filter=True,
+        dry_run=False,
+    )
+
+
+def test_pre_analysis_context_loader_fetches_missing_logs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    job_logs_dir = tmp_path / "logs"
+    job_logs_dir.mkdir()
+    config = _config(tmp_path, job_logs_dir=job_logs_dir)
+    pool = object()
+
+    def fake_resolve_job_log(
+        *,
+        config: Config,
+        job_id: str | None,
+        job_log: str | Path | None,
+        fetch: bool,
+        db_pool: object,
+    ) -> tuple[Path, str | None]:
+        assert fetch is True
+        assert job_id == "101"
+        assert db_pool is pool
+        log_path = job_logs_dir / "job_101.json"
+        log_path.write_text(
+            json.dumps(
+                {
+                    "events": [
+                        {
+                            "failed": True,
+                            "event": "runner_on_failed",
+                            "task": "Install dependencies",
+                            "play": "Setup",
+                            "role": "common",
+                            "created": "2026-01-01T00:00:00Z",
+                            "event_data": {
+                                "res": {"msg": "Connection reset by peer"},
+                                "task_path": "/roles/common/tasks/main.yml:10",
+                                "task_action": "yum",
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return log_path, job_id
+
+    monkeypatch.setattr(
+        "rca.analysis.pipeline._resolve_job_log", fake_resolve_job_log
+    )
+
+    contexts, job_log_paths = orchestrator._load_pre_analysis_contexts(
+        [101], config, pool
+    )
+
+    assert contexts[101]["failed_tasks"][0]["task"] == "Install dependencies"
+    assert job_log_paths == {101: job_logs_dir / "job_101.json"}
+
+
+def test_historical_task_signatures_load_from_saved_analysis_artifacts(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    analysis_dir = config.analysis_dir / "77"
+    analysis_dir.mkdir(parents=True)
+    (analysis_dir / "step1_job_context.json").write_text(
+        json.dumps(
+            {
+                "failed_tasks": [
+                    {
+                        "play": "Setup",
+                        "role": "common",
+                        "task": "Install dependencies",
+                        "task_action": "yum",
+                        "task_path": "/roles/common/tasks/main.yml",
+                        "error_message": "Connection reset by peer",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    results = [{"id": 77, "job_id": 77}]
+
+    orchestrator._attach_historical_task_signatures(results, config)
+
+    assert results[0]["task_signature"].identity_key == (
+        "setup",
+        "common",
+        "install dependencies",
+        "yum",
+        "/roles/common/tasks/main.yml",
+    )
+
+
+def test_historical_task_signatures_fall_back_to_local_job_logs(
+    tmp_path: Path,
+) -> None:
+    job_logs_dir = tmp_path / "logs"
+    job_logs_dir.mkdir()
+    (job_logs_dir / "job_77.json").write_text(
+        json.dumps(
+            {
+                "events": [
+                    {
+                        "failed": True,
+                        "event": "runner_on_failed",
+                        "task": "Install dependencies",
+                        "play": "Setup",
+                        "role": "",
+                        "created": "2026-01-01T00:00:00Z",
+                        "event_data": {
+                            "res": {"msg": "Connection reset by peer"},
+                            "task_path": "/roles/common/tasks/main.yml:10",
+                            "task_action": "yum",
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _config(tmp_path, job_logs_dir=job_logs_dir)
+    results = [{"id": 77, "job_id": 77}]
+
+    orchestrator._attach_historical_task_signatures(results, config)
+
+    assert results[0]["task_signature"].identity_key == (
+        "setup",
+        "",
+        "install dependencies",
+        "yum",
+        "/roles/common/tasks/main.yml",
+    )
+
+
+def test_main_passes_dry_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _config(tmp_path)
+    run_batch = Mock(return_value=0)
+    monkeypatch.setattr(orchestrator.Config, "from_env", classmethod(lambda cls: config))
+    monkeypatch.setattr(orchestrator, "run_batch", run_batch)
+
+    assert orchestrator.main(["--limit", "5", "--dry-run"]) == 0
+
+    run_batch.assert_called_once_with(
+        config,
+        since=None,
+        limit=5,
+        no_pre_filter=False,
+        dry_run=True,
     )
 
 
 def test_cli_rejects_non_positive_limit() -> None:
     with pytest.raises(SystemExit):
         orchestrator._build_parser().parse_args(["--limit", "0"])
+
+
+def test_packaged_prompts_load_without_filesystem_discovery() -> None:
+    prompt_files = {
+        "root_cause_analysis.md": orchestrator.RCA_INSTRUCTIONS,
+        "synthesis.md": orchestrator._SYNTHESIS_PROMPT_TEMPLATE.template,
+        "semantic.md": orchestrator._SEMANTIC_PROMPT_TEMPLATE.template,
+    }
+
+    for filename, prompt in prompt_files.items():
+        packaged_prompt = (
+            files("rca")
+            .joinpath("prompts")
+            .joinpath(filename)
+            .read_text(encoding="utf-8")
+        )
+        assert packaged_prompt == prompt
+
+    assert "root-cause analyst" in prompt_files["root_cause_analysis.md"]
+    assert "step5_analysis_summary.json" in prompt_files["root_cause_analysis.md"]
+    assert "Every entry requires `source`, `timestamp`, and `message`" in prompt_files[
+        "root_cause_analysis.md"
+    ]
+    assert "use an empty string for `timestamp`" in prompt_files["root_cause_analysis.md"]
+    assert "Never invent an event time" in prompt_files["root_cause_analysis.md"]
+    assert "GitHub MCP verification" in prompt_files["root_cause_analysis.md"]
+    assert "mcp__github__get_file_contents" in prompt_files["root_cause_analysis.md"]
+    assert "mcp__github__search_code" in prompt_files["root_cause_analysis.md"]
+    assert "$job_id" in prompt_files["synthesis.md"]
+    assert "$analysis_dir" in prompt_files["synthesis.md"]
+    assert "$job_summaries" in prompt_files["semantic.md"]
+    assert "$known_issues" in prompt_files["semantic.md"]
+
+
+def test_sdk_options_disable_discovery_and_use_packaged_instructions(
+    tmp_path: Path,
+) -> None:
+    class FakeSDK:
+        @staticmethod
+        def ClaudeAgentOptions(**kwargs: object) -> dict[str, object]:
+            return dict(kwargs)
+
+    config = _config(tmp_path)
+    options = orchestrator._make_sdk_options(
+        FakeSDK(),
+        config,
+        cwd=tmp_path,
+        system_prompt=orchestrator.RCA_INSTRUCTIONS,
+    )
+
+    assert options["setting_sources"] == []
+    assert options["skills"] == []
+    assert options["system_prompt"] == orchestrator.RCA_INSTRUCTIONS
+    assert "Skill" not in options["allowed_tools"]
+    assert options["allowed_tools"] == [
+        "Bash",
+        "Read",
+        "Write",
+        "mcp__github__search_code",
+        "mcp__github__get_file_contents",
+    ]
+
+
+def test_semantic_sdk_options_disable_tools_and_skill_discovery(
+    tmp_path: Path,
+) -> None:
+    class FakeSDK:
+        @staticmethod
+        def ClaudeAgentOptions(**kwargs: object) -> dict[str, object]:
+            return dict(kwargs)
+
+    config = _config(tmp_path)
+    options = orchestrator._make_sdk_options(
+        FakeSDK(),
+        config,
+        cwd=tmp_path,
+        system_prompt=None,
+    )
+
+    assert options["setting_sources"] == []
+    assert options["skills"] == []
+    assert options["tools"] == []
+    assert "system_prompt" not in options
+    assert "allowed_tools" not in options
+
+
+@pytest.mark.parametrize(
+    ("schema", "system_prompt", "expected_tools"),
+    [
+        (AnalysisSummary.model_json_schema(), orchestrator.RCA_INSTRUCTIONS, None),
+        (BatchSemanticOutput.model_json_schema(), None, []),
+    ],
+)
+def test_model_generated_schema_reaches_sdk_options_unchanged(
+    tmp_path: Path, schema: dict, system_prompt: str | None, expected_tools: list | None
+) -> None:
+    sdk = pytest.importorskip("claude_agent_sdk")
+    original_schema = json.loads(json.dumps(schema))
+    output_format = {"type": "json_schema", "schema": schema}
+
+    options = orchestrator._make_sdk_options(
+        sdk,
+        _config(tmp_path),
+        cwd=tmp_path,
+        system_prompt=system_prompt,
+        output_format=output_format,
+    )
+
+    assert options.output_format == output_format
+    assert options.output_format["schema"] is schema
+    assert schema == original_schema
+    assert options.tools == expected_tools
+    if system_prompt is None:
+        assert options.allowed_tools == ["StructuredOutput"]
+    else:
+        assert options.allowed_tools == [
+            "Bash", "Read", "Write", "mcp__github__search_code",
+            "mcp__github__get_file_contents", "StructuredOutput",
+        ]
+
+
+def test_synthesis_prompt_does_not_invoke_a_skill(tmp_path: Path) -> None:
+    analysis_dir = tmp_path / ".analysis" / "123"
+    artifacts = AnalysisArtifacts("123", analysis_dir, {}, {}, {}, {})
+
+    prompt = orchestrator._synthesis_prompt("123", artifacts)
+
+    assert "Skill" not in prompt
+    assert "Analyze AAP job 123" in prompt
+    assert str(analysis_dir) in prompt
+    assert "$analysis_dir" not in prompt
+
+
+def test_semantic_prompt_renders_packaged_data() -> None:
+    job_summaries = [{"job_id": 123, "confidence": "high"}]
+    known_issues = [{"result_id": 456}]
+    prompt = orchestrator._semantic_prompt(job_summaries, known_issues)
+
+    assert "Compare these newly analyzed jobs" in prompt
+    assert json.dumps(job_summaries) in prompt
+    assert json.dumps(known_issues) in prompt
+    assert "$job_summaries" not in prompt
+    assert "$known_issues" not in prompt
+
+
+def test_step5_persistence_preserves_nested_nullable_fields_and_extra_content(tmp_path: Path) -> None:
+    summary = _summary("123")
+    summary.update(
+        analyzed_at=None,
+        recommendations=[
+            {
+                "action": None,
+                "priority": None,
+                "evidence_ref": None,
+                "fix": {"status": "proposed", "base_sha": "abc", "diff": None, "pr_link": None},
+            },
+            {"details": None, "evidence_ref": None, "fix": None},
+        ],
+        causal_chain=[
+            {"step": 1, "relationship": "direct_cause", "statement": "Failure", "evidence_ref": None}
+        ],
+        misidentifications=[
+            {
+                "theory": "DNS",
+                "why_suspected": "Connection failed",
+                "why_ruled_out": "Resolution succeeded",
+                "evidence_ref": None,
+            }
+        ],
+        extra_context={"unavailable": None, "nested": [{"value": None}]},
+    )
+    summary["evidence"][0]["github_path"] = None
+    summary["evidence"][0]["extra_details"] = {"unavailable": None}
+    original = json.loads(json.dumps(summary))
+
+    artifacts = AnalysisArtifacts("123", tmp_path, {}, {}, {}, {})
+    orchestrator._write_step5_summary(artifacts, summary)
+
+    saved = json.loads((tmp_path / "step5_analysis_summary.json").read_text())
+    assert saved == original
+    assert summary == original
 
 
 def test_sdk_result_usage_and_semaphore_limit(
@@ -96,12 +456,25 @@ def test_sdk_result_usage_and_semaphore_limit(
             option_values.append(options)
             return options
 
-        async def query(self, *, prompt: str, options: dict[str, object]):
-            nonlocal active, peak_active
-            active += 1
-            peak_active = max(peak_active, active)
-            try:
+        class ClaudeSDKClient:
+            def __init__(self, options: dict[str, object]):
+                self.options = options
+
+            async def __aenter__(self):
+                nonlocal active, peak_active
+                active += 1
+                peak_active = max(peak_active, active)
+                return self
+
+            async def __aexit__(self, *_args: object):
+                nonlocal active
+                active -= 1
+
+            async def query(self, prompt: str) -> None:
+                self.prompt = prompt
                 await asyncio.sleep(0.01)
+
+            async def receive_response(self):
                 yield SimpleNamespace(
                     is_error=False,
                     total_cost_usd=0.125,
@@ -113,16 +486,15 @@ def test_sdk_result_usage_and_semaphore_limit(
                             "costUSD": 0.125,
                         }
                     },
-                    result=f"completed {prompt}",
+                    result=f"completed {self.prompt}",
                     structured_output={"ok": True},
                     errors=[],
                     session_id="session-test",
                 )
-            finally:
-                active -= 1
 
     monkeypatch.setattr(orchestrator, "_load_agent_sdk", lambda: FakeSDK())
     config = _config(tmp_path, max_parallel_jobs=2)
+    output_format = {"type": "json_schema", "schema": orchestrator._SEMANTIC_OUTPUT_SCHEMA}
 
     async def run_queries():
         semaphore = asyncio.Semaphore(config.max_parallel_jobs)
@@ -133,7 +505,8 @@ def test_sdk_result_usage_and_semaphore_limit(
                     config,
                     cwd=tmp_path,
                     semaphore=semaphore,
-                    include_skill=True,
+                    system_prompt=orchestrator.RCA_INSTRUCTIONS,
+                    output_format=output_format,
                 )
                 for index in range(5)
             )
@@ -156,7 +529,93 @@ def test_sdk_result_usage_and_semaphore_limit(
     assert results[0].text == "completed job 0"
     assert results[0].structured_output == {"ok": True}
     assert results[0].session_id == "session-test"
-    assert all(item["skills"] == ["root-cause-analysis"] for item in option_values)
+    assert all(item["system_prompt"] == orchestrator.RCA_INSTRUCTIONS for item in option_values)
+    assert all(item["output_format"] == output_format for item in option_values)
+    assert all("StructuredOutput" in item["allowed_tools"] for item in option_values)
+
+
+def test_synthesis_passes_the_model_generated_schema_to_a_single_sdk_query(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _config(tmp_path)
+    analysis_dir = config.analysis_dir / "101"
+    artifacts = AnalysisArtifacts("101", analysis_dir, {}, {}, {}, {})
+    prompt = orchestrator._synthesis_prompt("101", artifacts)
+    semaphore = asyncio.Semaphore(1)
+    original_schema = AnalysisSummary.model_json_schema()
+    sdk_result = orchestrator.SDKQueryResult(
+        False,
+        0.02,
+        {"input_tokens": 20, "output_tokens": 5},
+        "Summary returned",
+        model_usage={"claude-test": {"inputTokens": 20, "costUSD": 0.02}},
+        structured_output=_summary("101"),
+        session_id="synthesis-session",
+    )
+    query = AsyncMock(return_value=sdk_result)
+    monkeypatch.setattr(orchestrator, "_run_sdk_query", query)
+
+    result = asyncio.run(
+        orchestrator._run_synthesis(
+            prompt,
+            config,
+            artifacts=artifacts,
+            cwd=tmp_path,
+            semaphore=semaphore,
+            summary_job_id="101",
+        )
+    )
+
+    expected_schema = json.loads(json.dumps(original_schema))
+    expected_schema["properties"]["job_id"]["enum"] = ["101"]
+    query.assert_awaited_once_with(
+        prompt,
+        config,
+        cwd=tmp_path,
+        semaphore=semaphore,
+        system_prompt=orchestrator.RCA_INSTRUCTIONS,
+        output_format={"type": "json_schema", "schema": expected_schema},
+    )
+    schema = query.await_args.kwargs["output_format"]["schema"]
+    validator = jsonschema.Draft202012Validator(schema)
+    validator.validate(_summary("101"))
+    assert not validator.is_valid(_summary("999"))
+    assert orchestrator._SUMMARY_OUTPUT_SCHEMA == original_schema
+    assert result is sdk_result
+
+
+@pytest.mark.parametrize("failure", ["sdk_error", "missing_output", "transport_error"])
+def test_synthesis_failures_do_not_write_or_upload_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    config = _config(tmp_path)
+    analysis_dir = config.analysis_dir / "101"
+    analysis_dir.mkdir(parents=True)
+    artifacts = AnalysisArtifacts("101", analysis_dir, {}, {}, {}, {})
+    query = AsyncMock(
+        side_effect=RuntimeError("SDK transport failed") if failure == "transport_error" else None,
+        return_value=orchestrator.SDKQueryResult(
+            failure == "sdk_error",
+            0.02,
+            {},
+            "SDK request failed",
+            structured_output=_summary("101") if failure == "sdk_error" else None,
+            errors=("SDK request failed",) if failure == "sdk_error" else (),
+        ),
+    )
+    uploader = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "run_analysis", Mock(return_value=artifacts))
+    monkeypatch.setattr(orchestrator, "_run_sdk_query", query)
+    monkeypatch.setattr(orchestrator, "upload_to_jumpbox", uploader)
+
+    execution = asyncio.run(
+        orchestrator._analyze_jobs([101], config, object(), cwd=tmp_path)
+    )[0]
+
+    assert execution.status == "failed"
+    query.assert_awaited_once()
+    assert not (analysis_dir / "step5_analysis_summary.json").exists()
+    uploader.assert_not_called()
 
 
 def test_job_failures_are_isolated_from_other_jobs(
@@ -177,18 +636,18 @@ def test_job_failures_are_isolated_from_other_jobs(
             github_fetch_history={},
         )
 
-    async def fake_sdk_query(*args: object, **kwargs: object) -> orchestrator.SDKQueryResult:
-        _write_summary(tmp_path / ".analysis" / "102")
+    async def fake_synthesis(*args: object, **kwargs: object) -> orchestrator.SDKQueryResult:
         return orchestrator.SDKQueryResult(
             is_error=False,
             cost_usd=0.02,
             usage={"input_tokens": 20},
             model_usage={"claude-test-v1": {"inputTokens": 20, "costUSD": 0.02}},
-            text="uploaded",
+            text="summary returned",
+            structured_output=_summary("102"),
         )
 
     monkeypatch.setattr(orchestrator, "run_analysis", fake_run_analysis)
-    monkeypatch.setattr(orchestrator, "_run_sdk_query", fake_sdk_query)
+    monkeypatch.setattr(orchestrator, "_run_synthesis", fake_synthesis)
     monkeypatch.setattr(orchestrator, "upload_to_jumpbox", Mock(return_value=True))
     config = _config(tmp_path, max_parallel_jobs=2)
 
@@ -206,7 +665,7 @@ def test_job_failures_are_isolated_from_other_jobs(
     }
 
 
-def test_job_concurrency_bounds_analysis_and_skill_as_one_unit(
+def test_job_concurrency_bounds_analysis_and_agent_query_as_one_unit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     active_jobs: set[str] = set()
@@ -232,15 +691,15 @@ def test_job_concurrency_bounds_analysis_and_skill_as_one_unit(
             github_fetch_history={},
         )
 
-    async def fake_sdk_query(prompt: str, *args: object, **kwargs: object) -> orchestrator.SDKQueryResult:
+    async def fake_synthesis(prompt: str, *args: object, **kwargs: object) -> orchestrator.SDKQueryResult:
         job_id = prompt.split("AAP job ", 1)[1].split(" ", 1)[0]
         await asyncio.sleep(0.04)
-        _write_summary(tmp_path / ".analysis" / job_id)
         return orchestrator.SDKQueryResult(
             is_error=False,
             cost_usd=0.01,
             usage={},
-            text="summary written",
+            text="summary returned",
+            structured_output=_summary(job_id),
         )
 
     def fake_upload(job_id: str, *args: object, **kwargs: object) -> bool:
@@ -250,7 +709,7 @@ def test_job_concurrency_bounds_analysis_and_skill_as_one_unit(
         return True
 
     monkeypatch.setattr(orchestrator, "run_analysis", fake_run_analysis)
-    monkeypatch.setattr(orchestrator, "_run_sdk_query", fake_sdk_query)
+    monkeypatch.setattr(orchestrator, "_run_synthesis", fake_synthesis)
     monkeypatch.setattr(orchestrator, "upload_to_jumpbox", fake_upload)
     config = _config(tmp_path, max_parallel_jobs=2)
 
@@ -274,7 +733,7 @@ def test_retry_rejects_a_previous_step5_summary(
     monkeypatch.setattr(orchestrator, "run_analysis", Mock(return_value=artifacts))
     monkeypatch.setattr(
         orchestrator,
-        "_run_sdk_query",
+        "_run_synthesis",
         AsyncMock(return_value=orchestrator.SDKQueryResult(False, 0.02, {}, "No summary written")),
     )
     upload = Mock(return_value=True)
@@ -300,13 +759,17 @@ def test_job_success_requires_a_verified_upload(
     artifacts = AnalysisArtifacts("101", analysis_dir, {}, {}, {}, {})
     monkeypatch.setattr(orchestrator, "run_analysis", Mock(return_value=artifacts))
 
-    async def fake_sdk_query(*args: object, **kwargs: object) -> orchestrator.SDKQueryResult:
-        _write_summary(analysis_dir)
+    async def fake_synthesis(*args: object, **kwargs: object) -> orchestrator.SDKQueryResult:
         return orchestrator.SDKQueryResult(
-            False, 0.02, {"input_tokens": 20}, "summary written", session_id="job-session"
+            False,
+            0.02,
+            {"input_tokens": 20},
+            "summary returned",
+            structured_output=_summary("101"),
+            session_id="job-session",
         )
 
-    monkeypatch.setattr(orchestrator, "_run_sdk_query", fake_sdk_query)
+    monkeypatch.setattr(orchestrator, "_run_synthesis", fake_synthesis)
     upload = (
         Mock(side_effect=upload_result)
         if isinstance(upload_result, Exception)
@@ -373,6 +836,7 @@ def test_batch_exit_status_preserves_reports_and_partial_success(
     expected_exit: int,
 ) -> None:
     config = _config(tmp_path)
+    monkeypatch.setattr(orchestrator, "ensure_jumpbox_alias", Mock())
     executions = [
         orchestrator.JobExecution(
             str(101 + index),
@@ -457,19 +921,304 @@ def test_failed_representative_falls_back_to_next_duplicate(
         "_analyze_jobs",
         AsyncMock(return_value=recovered),
     )
+    pool = object()
 
     executions, updated_dupes = orchestrator._recover_failed_representatives(
         executions,
         dupes,
         set(),
         config,
-        object(),
+        pool,
         cwd=tmp_path,
+    )
+
+    orchestrator._analyze_jobs.assert_called_once_with(
+        [101], config, pool, cwd=tmp_path, dry_run=False
     )
 
     assert [execution.job_id for execution in executions] == ["100", "101"]
     assert executions[-1].job_id == "101"
     assert updated_dupes == [{"job_id": 102, "representative_job_id": 101}]
+
+
+def test_pre_analysis_fetches_contexts_only_for_unresolved_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    pool = object()
+    metadata = {
+        10: {"job_name": "RHPDS platform.widget.dev-10-create"},
+        11: {"job_name": "RHPDS platform.widget.dev-11-create"},
+        12: {"job_name": "RHPDS platform.widget.dev-12-create"},
+    }
+    recent_results = [
+        {
+            "id": 90,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "root_cause_summary": "Known issue",
+        }
+    ]
+    context = {"failed_tasks": [{"task": "Install dependencies"}]}
+    log_path = tmp_path / "job_10.json"
+    gate_task_contexts = []
+
+    def fake_pre_analysis_gate(
+        job_ids: list[int],
+        job_metadata: dict[int, dict[str, object]],
+        historical: list[dict[str, object]],
+        *,
+        use_history: bool,
+        task_contexts: dict[int, dict[str, object]] | None = None,
+    ) -> tuple[list[int], dict[int, int], list[dict[str, object]]]:
+        gate_task_contexts.append(task_contexts)
+        if task_contexts is None:
+            return [10], {11: 90, 12: 90}, []
+        return [], {11: 90, 12: 90}, []
+
+    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
+    monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[10, 11, 12]))
+    monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value=metadata))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=recent_results))
+    monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[]))
+    monkeypatch.setattr(orchestrator, "_attach_historical_task_signatures", Mock())
+    monkeypatch.setattr(orchestrator, "pre_analysis_gate", fake_pre_analysis_gate)
+    context_loader = Mock(return_value=({10: context}, {10: log_path}))
+    monkeypatch.setattr(orchestrator, "_load_pre_analysis_contexts", context_loader)
+    monkeypatch.setattr(orchestrator, "store_pre_matched", Mock())
+    analyze_jobs = Mock()
+    monkeypatch.setattr(orchestrator, "_analyze_jobs", analyze_jobs)
+
+    assert orchestrator.run_batch(config, pool=pool, cwd=tmp_path) == 0
+
+    assert gate_task_contexts == [None, {10: context}]
+    assert context_loader.call_args.args == ([10], config, pool)
+    analyze_jobs.assert_not_called()
+
+
+def test_dry_run_writes_report_without_database_or_jumpbox_writes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    execution = orchestrator.JobExecution(
+        "101",
+        "completed",
+        1,
+        summary={"root_cause": {"summary": "test", "category": "unknown"}},
+    )
+    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
+    monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[101]))
+    monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value={}))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=[]))
+    monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[]))
+    monkeypatch.setattr(
+        orchestrator,
+        "pre_analysis_gate",
+        Mock(return_value=([101], {}, [])),
+    )
+    monkeypatch.setattr(orchestrator, "store_pre_matched", Mock())
+    monkeypatch.setattr(
+        orchestrator,
+        "_analyze_jobs",
+        AsyncMock(return_value=[execution]),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_aggregate_semantics",
+        AsyncMock(return_value=([], None)),
+    )
+    monkeypatch.setattr(orchestrator, "_log_mlflow_usage", Mock())
+    store = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "_store_batch_report", store)
+
+    assert orchestrator.run_batch(
+        config,
+        pool=object(),
+        cwd=tmp_path,
+        dry_run=True,
+    ) == 0
+
+    orchestrator.store_pre_matched.assert_not_called()
+    store.assert_not_called()
+    report_files = list((tmp_path / "reports").glob("batch_*.json"))
+    assert len(report_files) == 1
+
+
+def test_run_batch_prepares_jumpbox_alias_before_analysis(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    execution = orchestrator.JobExecution(
+        "101",
+        "completed",
+        1,
+        summary={"root_cause": {"summary": "test", "category": "unknown"}},
+    )
+    order: list[str] = []
+    analysis_calls: list[tuple[object, ...]] = []
+    ensure_alias = Mock(side_effect=lambda _config: order.append("alias"))
+
+    async def analyze_jobs(*args: object, **kwargs: object) -> list[orchestrator.JobExecution]:
+        analysis_calls.append((*args, kwargs))
+        order.append("analysis")
+        return [execution]
+
+    monkeypatch.setattr(orchestrator, "ensure_jumpbox_alias", ensure_alias)
+    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
+    monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[101]))
+    monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value={}))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=[]))
+    monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[]))
+    monkeypatch.setattr(
+        orchestrator,
+        "pre_analysis_gate",
+        Mock(return_value=([101], {}, [])),
+    )
+    monkeypatch.setattr(orchestrator, "_analyze_jobs", analyze_jobs)
+    monkeypatch.setattr(
+        orchestrator,
+        "_aggregate_semantics",
+        AsyncMock(return_value=([], None)),
+    )
+    monkeypatch.setattr(orchestrator, "_log_mlflow_usage", Mock())
+    monkeypatch.setattr(
+        orchestrator,
+        "_store_batch_report",
+        Mock(return_value=True),
+    )
+
+    assert orchestrator.run_batch(config, pool=object(), cwd=tmp_path) == 0
+
+    ensure_alias.assert_called_once_with(config)
+    assert len(analysis_calls) == 1
+    assert order == ["alias", "analysis"]
+
+
+def test_run_batch_dry_run_skips_jumpbox_alias_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    execution = orchestrator.JobExecution(
+        "101",
+        "completed",
+        1,
+        summary={"root_cause": {"summary": "test", "category": "unknown"}},
+    )
+    ensure_alias = Mock()
+    analyze_jobs = AsyncMock(return_value=[execution])
+
+    monkeypatch.setattr(orchestrator, "ensure_jumpbox_alias", ensure_alias)
+    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
+    monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[101]))
+    monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value={}))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=[]))
+    monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[]))
+    monkeypatch.setattr(
+        orchestrator,
+        "pre_analysis_gate",
+        Mock(return_value=([101], {}, [])),
+    )
+    monkeypatch.setattr(orchestrator, "_analyze_jobs", analyze_jobs)
+    monkeypatch.setattr(
+        orchestrator,
+        "_aggregate_semantics",
+        AsyncMock(return_value=([], None)),
+    )
+    monkeypatch.setattr(orchestrator, "_log_mlflow_usage", Mock())
+    monkeypatch.setattr(
+        orchestrator,
+        "_store_batch_report",
+        Mock(return_value=True),
+    )
+
+    assert orchestrator.run_batch(
+        config,
+        pool=object(),
+        cwd=tmp_path,
+        dry_run=True,
+    ) == 0
+
+    ensure_alias.assert_not_called()
+    analyze_jobs.assert_called_once()
+
+
+def test_run_batch_stops_before_analysis_when_jumpbox_alias_preparation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    ensure_alias = Mock(side_effect=OSError("cannot write SSH config"))
+    analyze_jobs = AsyncMock()
+
+    monkeypatch.setattr(orchestrator, "ensure_jumpbox_alias", ensure_alias)
+    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
+    monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[101]))
+    monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value={}))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=[]))
+    monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[]))
+    monkeypatch.setattr(
+        orchestrator,
+        "pre_analysis_gate",
+        Mock(return_value=([101], {}, [])),
+    )
+    monkeypatch.setattr(orchestrator, "_analyze_jobs", analyze_jobs)
+    store = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "_store_batch_report", store)
+
+    assert orchestrator.run_batch(config, pool=object(), cwd=tmp_path) == 1
+
+    ensure_alias.assert_called_once_with(config)
+    analyze_jobs.assert_not_called()
+    store.assert_not_called()
+
+
+def test_dry_run_skips_jumpbox_upload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = _config(tmp_path)
+    analysis_dir = config.analysis_dir / "101"
+    analysis_dir.mkdir(parents=True)
+    artifacts = AnalysisArtifacts("101", analysis_dir, {}, {}, {}, {})
+    upload = Mock(return_value=True)
+    monkeypatch.setattr(orchestrator, "run_analysis", Mock(return_value=artifacts))
+    sdk_kwargs: dict[str, object] = {}
+
+    async def fake_synthesis(*args: object, **kwargs: object) -> orchestrator.SDKQueryResult:
+        sdk_kwargs.update(kwargs)
+        return orchestrator.SDKQueryResult(
+            False,
+            0.02,
+            {"input_tokens": 20},
+            "summary returned",
+            structured_output=_summary("101"),
+            session_id="job-session",
+        )
+
+    monkeypatch.setattr(orchestrator, "_run_synthesis", fake_synthesis)
+    monkeypatch.setattr(orchestrator, "upload_to_jumpbox", upload)
+
+    execution = asyncio.run(
+        orchestrator._execute_one_job(
+            101,
+            config,
+            object(),
+            ThreadPoolExecutor(max_workers=1),
+            asyncio.Semaphore(1),
+            tmp_path,
+            True,
+        )
+    )
+
+    upload.assert_not_called()
+    assert execution.status == "completed"
+    assert sdk_kwargs["artifacts"] is artifacts
+    assert sdk_kwargs["summary_job_id"] == "101"
+    assert execution.summary == _summary("101")
+    assert json.loads((analysis_dir / "step5_analysis_summary.json").read_text()) == _summary("101")
 
 
 def test_store_batch_report_links_in_one_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -737,7 +1486,7 @@ def test_normalize_semantics_picks_numeric_min_pattern_id() -> None:
     assert normalized["cross_job_patterns"][0]["pattern_id"] == "9"
 
 
-def test_aggregate_semantics_uses_packaged_output_schema(
+def test_aggregate_semantics_uses_model_generated_output_schema(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     query_result = orchestrator.SDKQueryResult(
@@ -765,12 +1514,7 @@ def test_aggregate_semantics_uses_packaged_output_schema(
         )
     )
 
-    expected_schema = json.loads(
-        files("rca")
-        .joinpath("schemas")
-        .joinpath("batch_semantic_output.schema.json")
-        .read_text(encoding="utf-8")
-    )
+    expected_schema = BatchSemanticOutput.model_json_schema()
     assert cross_patterns == []
     assert result is query_result
     assert sdk_query.call_args.kwargs["output_format"] == {
@@ -779,8 +1523,9 @@ def test_aggregate_semantics_uses_packaged_output_schema(
     }
 
 
+@pytest.mark.parametrize("failure", ["unavailable", "invalid_output"])
 def test_semantic_failure_falls_back_to_deterministic_matching(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
 ) -> None:
     artifacts = AnalysisArtifacts(
         job_id="201",
@@ -812,11 +1557,22 @@ def test_semantic_failure_falls_back_to_deterministic_matching(
         "recurrence_count": 2,
         "pattern_id": "9",
     }
-    monkeypatch.setattr(
-        orchestrator,
-        "_aggregate_semantics",
-        AsyncMock(side_effect=RuntimeError("semantic unavailable")),
-    )
+    if failure == "unavailable":
+        monkeypatch.setattr(
+            orchestrator,
+            "_aggregate_semantics",
+            AsyncMock(side_effect=RuntimeError("semantic unavailable")),
+        )
+    else:
+        monkeypatch.setattr(
+            orchestrator,
+            "_run_sdk_query",
+            AsyncMock(
+                return_value=orchestrator.SDKQueryResult(
+                    False, None, {}, "", structured_output={"historical_matches": []}
+                )
+            ),
+        )
 
     summaries, cross_patterns, aggregation_result = orchestrator._run_agent_batch(
         [execution], [known_issue], _config(tmp_path), cwd=tmp_path
@@ -1085,3 +1841,132 @@ def test_mlflow_logs_sdk_cost_usage_and_per_model_usage(
     assert metrics["batch_model_claude-test-v1_costUSD"] == pytest.approx(0.12)
     assert metrics["batch_input_tokens"] == 13
     assert metrics["batch_cost_usd"] == pytest.approx(0.12)
+
+
+def test_mlflow_omits_incomplete_batch_cost_but_keeps_tokens_and_known_costs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    metrics: dict[str, float] = {}
+    mlflow = ModuleType("mlflow")
+    mlflow.set_tracking_uri = Mock()
+    mlflow.get_experiment_by_name = Mock(return_value=SimpleNamespace(experiment_id="exp-1"))
+    mlflow.start_run = Mock(return_value=nullcontext())
+    mlflow.set_tags = Mock()
+    mlflow.log_metric = lambda name, value: metrics.__setitem__(name, value)
+    monkeypatch.setitem(sys.modules, "mlflow", mlflow)
+    config = _config(tmp_path)
+    config.environment.update(
+        {
+            "MLFLOW_TRACKING_URI": "file:///tmp/mlruns",
+            "MLFLOW_EXPERIMENT_NAME": "rca-tests",
+        }
+    )
+    executions = [
+        orchestrator.JobExecution(
+            "42", "completed", 100, cost_usd=0.1,
+            usage={"input_tokens": 10, "output_tokens": 4},
+        ),
+        orchestrator.JobExecution(
+            "43", "completed", 100, cost_usd=None,
+            usage={"input_tokens": 7, "output_tokens": 3},
+        ),
+    ]
+    aggregation = orchestrator.SDKQueryResult(
+        False, 0.02, {"input_tokens": 3}, "aggregated"
+    )
+
+    orchestrator._log_mlflow_usage(config, "batch-test", executions, aggregation)
+
+    assert "batch_cost_usd" not in metrics
+    assert "job_43_cost_usd" not in metrics
+    assert metrics["job_42_cost_usd"] == pytest.approx(0.1)
+    assert metrics["batch_aggregation_cost_usd"] == pytest.approx(0.02)
+    assert metrics["job_43_input_tokens"] == 7
+    assert metrics["batch_aggregation_input_tokens"] == 3
+    assert metrics["batch_input_tokens"] == 20
+    assert metrics["batch_output_tokens"] == 7
+
+
+def test_mlflow_tracing_is_opt_in_and_configures_agent_sdk_autolog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mlflow = ModuleType("mlflow")
+    mlflow.set_tracking_uri = Mock()
+    mlflow.set_experiment = Mock()
+    anthropic = ModuleType("mlflow.anthropic")
+    anthropic.autolog = Mock()
+    mlflow.anthropic = anthropic
+    monkeypatch.setitem(sys.modules, "mlflow", mlflow)
+    monkeypatch.setitem(sys.modules, "mlflow.anthropic", anthropic)
+
+    config = _config(tmp_path)
+    config.environment.update(
+        {
+            "MLFLOW_CLAUDE_TRACING_ENABLED": "true",
+            "MLFLOW_TRACKING_URI": "https://mlflow.example.test",
+            "MLFLOW_EXPERIMENT_NAME": "rca-tests",
+        }
+    )
+
+    orchestrator._enable_mlflow_tracing(config)
+
+    mlflow.set_tracking_uri.assert_called_once_with("https://mlflow.example.test")
+    mlflow.set_experiment.assert_called_once_with("rca-tests")
+    anthropic.autolog.assert_called_once_with()
+
+
+def test_mlflow_tracing_is_skipped_when_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mlflow = ModuleType("mlflow")
+    mlflow.set_tracking_uri = Mock()
+    mlflow.anthropic = ModuleType("mlflow.anthropic")
+    mlflow.anthropic.autolog = Mock()
+    monkeypatch.setitem(sys.modules, "mlflow", mlflow)
+
+    config = _config(tmp_path)
+    config.environment.update(
+        {
+            "MLFLOW_CLAUDE_TRACING_ENABLED": "false",
+            "MLFLOW_TRACKING_URI": "https://mlflow.example.test",
+            "MLFLOW_EXPERIMENT_NAME": "rca-tests",
+        }
+    )
+
+    orchestrator._enable_mlflow_tracing(config)
+
+    mlflow.set_tracking_uri.assert_not_called()
+    mlflow.anthropic.autolog.assert_not_called()
+
+
+def test_batch_disables_pipeline_tracing_without_disabling_agent_tracing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline_calls: list[str] = []
+
+    class FakeMLflow:
+        def trace(self, name: str, span_type=None):
+            def decorator(fn):
+                def wrapper(*args: object, **kwargs: object):
+                    pipeline_calls.append(name)
+                    return fn(*args, **kwargs)
+
+                return wrapper
+
+            return decorator
+
+    monkeypatch.setattr(tracing, "HAS_MLFLOW", True)
+    monkeypatch.setattr(tracing, "mlflow", FakeMLflow())
+    tracing.set_pipeline_tracing_enabled(True)
+
+    @tracing.trace("Pipeline step")
+    def pipeline_step() -> str:
+        return "ok"
+
+    tracing.set_pipeline_tracing_enabled(False)
+    assert pipeline_step() == "ok"
+    assert pipeline_calls == []
+
+    tracing.set_pipeline_tracing_enabled(True)
+    assert pipeline_step() == "ok"
+    assert pipeline_calls == ["Pipeline step"]

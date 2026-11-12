@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${JUMPBOX_NAME}
+  labels:
+    app: ${JUMPBOX_NAME}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${JUMPBOX_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${JUMPBOX_NAME}
+    spec:
+      containers:
+      - name: sshd
+        # Built from ci/images/sshd; substituted by the workflow.
+        image: ${SSHD_IMAGE}
+        env:
+        - name: SSHD_PORT
+          value: "${JUMPBOX_PORT}"
+        - name: SSHD_USER
+          value: ${JUMPBOX_USER}
+        ports:
+        - containerPort: ${JUMPBOX_PORT}
+        readinessProbe:
+          exec:
+            command: ["/bin/bash", "-c", "timeout 2 bash -c '</dev/tcp/127.0.0.1/${JUMPBOX_PORT}'"]
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 12
+        volumeMounts:
+        - name: jumpbox-key
+          mountPath: /keys
+          readOnly: true
+      volumes:
+      - name: jumpbox-key
+        secret:
+          # Created by the workflow; holds id_ed25519 and id_ed25519.pub
+          secretName: ${JUMPBOX_KEY_SECRET}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${JUMPBOX_NAME}
+  labels:
+    app: ${JUMPBOX_NAME}
+spec:
+  selector:
+    app: ${JUMPBOX_NAME}
+  ports:
+  - port: ${JUMPBOX_PORT}
+    targetPort: ${JUMPBOX_PORT}

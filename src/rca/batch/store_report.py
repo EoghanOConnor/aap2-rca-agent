@@ -8,26 +8,18 @@ import json
 import os
 import sys
 from collections.abc import Mapping
-from importlib.resources import files
 from typing import Any
 
-import jsonschema
 import psycopg2
 import psycopg2.extras
 import psycopg2.sql
+from pydantic import ValidationError
 
 from rca.config import load_database_config
 from rca.database import connect_db
 from rca.batch.match import Confidence, MatchSignals, score_similarity, weakest_confidence
-
-
-
-_ROOT_CAUSE_SCHEMA: dict[str, Any] = json.loads(
-    files("rca")
-    .joinpath("schemas")
-    .joinpath("root_cause.schema.json")
-    .read_text(encoding="utf-8")
-)
+from rca.models import RootCauseDetail
+from rca.models.base import format_validation_errors
 
 
 def _load_step5(analysis_path: str | None, jid: str) -> dict[str, Any] | None:
@@ -136,13 +128,27 @@ def build_root_cause(job: dict[str, Any], jid: str) -> dict[str, Any]:
         "recommendations": _normalize_recommendations(step5.get("recommendations")),
     }
     try:
-        jsonschema.validate(instance=root_cause, schema=_ROOT_CAUSE_SCHEMA)
-    except jsonschema.ValidationError as exc:
+        RootCauseDetail.model_validate(root_cause)
+    except ValidationError as exc:
         print(
-            f"[WARN] job {jid}: assembled root_cause failed schema validation: {exc.message}",
+            f"[WARN] job {jid}: assembled root_cause failed schema validation: "
+            + format_validation_errors(exc),
             file=sys.stderr,
         )
     return root_cause
+
+
+def _relationship_values(job: dict[str, Any]) -> tuple[int | None, str | None]:
+    raw_result_id = job.get("related_result_id")
+    try:
+        related_result_id = int(raw_result_id) if raw_result_id is not None else None
+    except (TypeError, ValueError):
+        related_result_id = None
+
+    related_result_confidence = job.get("related_result_confidence")
+    if related_result_confidence not in ("high", "medium", "low"):
+        related_result_confidence = None
+    return related_result_id, related_result_confidence
 
 
 def store_report(
@@ -170,19 +176,30 @@ def store_report(
         for job in jobs:
             jid = str(job.get("job_id", ""))
             status = job.get("status")
+            root_cause = build_root_cause(job, jid)
+            recommendation = root_cause.get("recommendations", [])
+            related_result_id, related_result_confidence = _relationship_values(job)
             cur.execute(
                 psycopg2.sql.SQL(
-                    """INSERT INTO {}
+                    """INSERT INTO {} AS result
                        (batch_id, job_id, status, root_cause_category, root_cause,
-                        confidence, catalog_item, job_duration_seconds)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        confidence, catalog_item, job_duration_seconds,
+                        related_result_id, related_result_confidence, recommendation)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                        ON CONFLICT (batch_id, job_id) DO UPDATE SET
                            status = EXCLUDED.status,
                            root_cause_category = EXCLUDED.root_cause_category,
                            root_cause = EXCLUDED.root_cause,
                            confidence = EXCLUDED.confidence,
                            catalog_item = EXCLUDED.catalog_item,
-                           job_duration_seconds = EXCLUDED.job_duration_seconds
+                           job_duration_seconds = EXCLUDED.job_duration_seconds,
+                           related_result_id =
+                               COALESCE(EXCLUDED.related_result_id, result.related_result_id),
+                           related_result_confidence =
+                               CASE WHEN EXCLUDED.related_result_id IS NOT NULL
+                                    THEN EXCLUDED.related_result_confidence
+                                    ELSE result.related_result_confidence END,
+                           recommendation = EXCLUDED.recommendation
                        RETURNING id"""
                 ).format(psycopg2.sql.Identifier(results_table)),
                 (
@@ -190,10 +207,13 @@ def store_report(
                     jid,
                     status,
                     job.get("root_cause_category"),
-                    psycopg2.extras.Json(build_root_cause(job, jid)),
+                    psycopg2.extras.Json(root_cause),
                     job.get("confidence"),
                     job.get("catalog_item"),
                     job.get("job_duration_seconds"),
+                    related_result_id,
+                    related_result_confidence,
+                    psycopg2.extras.Json(recommendation),
                 ),
             )
             row = cur.fetchone()
@@ -410,9 +430,9 @@ def _assign_clusters(
     results_table: str,
     links: list[tuple[int, int, Confidence]],
     known_rows: dict[int, dict[str, Any]] | None = None,
-) -> list[int | None]:
+) -> tuple[list[int | None], dict[int, Confidence]]:
     if not links:
-        return []
+        return [], {}
 
     lookup_ids = {
         int(result_id)
@@ -471,7 +491,7 @@ def _assign_clusters(
         assigned_anchors[index] = source_root
 
     if not valid_link_indices:
-        return assigned_anchors
+        return assigned_anchors, {}
 
     existing_anchors = {
         resolved_anchors[result_id]
@@ -530,7 +550,10 @@ def _assign_clusters(
     for index, (source_result_id, _, _) in enumerate(links):
         if index in valid_link_indices:
             assigned_anchors[index] = find(resolved_anchors[source_result_id])
-    return assigned_anchors
+    cluster_confidences = {
+        find(anchor): confidences.get(find(anchor), "low") for anchor in old_anchors
+    }
+    return assigned_anchors, cluster_confidences
 
 
 def post_analysis_link(
@@ -671,7 +694,7 @@ def post_analysis_link(
                     (int(result_id), int(matched_result_id), score.confidence)
                 )
 
-        canonical_anchors = _assign_clusters(
+        canonical_anchors, cluster_confidences = _assign_clusters(
             cur,
             results_table,
             links,
@@ -711,6 +734,17 @@ def post_analysis_link(
             match = job["historical_matches"][match_index]
             match["pattern_id"] = str(canonical_anchor)
             register_source_anchor(job_index, canonical_anchor)
+
+        for job_index, canonical_anchor in source_match_result_ids.items():
+            job = jobs[job_index]
+            result_id = job.get("result_id")
+            if result_id is None:
+                continue
+            is_anchor = int(result_id) == canonical_anchor
+            job["related_result_id"] = None if is_anchor else canonical_anchor
+            job["related_result_confidence"] = (
+                None if is_anchor else cluster_confidences[canonical_anchor]
+            )
 
         for job_index, source_match_result_id in source_match_result_ids.items():
             job_id = str(jobs[job_index].get("job_id", ""))

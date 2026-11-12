@@ -1,12 +1,29 @@
 """Build correlation between AAP job logs and Splunk pod logs."""
 
 import json
+import socket
 from datetime import datetime, timezone
 from typing import Any
+import urllib.error
 
 from ..config import Config
 from .splunk_client import SplunkClient
 from .tracing import SpanType, trace
+
+
+def _is_splunk_unavailable(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(
+            exc.reason,
+            (socket.gaierror, ConnectionError, TimeoutError),
+        )
+    return isinstance(exc, (socket.gaierror, ConnectionError, TimeoutError))
+
+
+def _mark_splunk_unavailable(results: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    results["skipped"] = True
+    results["reason"] = f"Splunk is unavailable: {exc}"
+    return results
 
 
 @trace(name="Fetch correlated Splunk logs", span_type=SpanType.CHAIN if SpanType else None)
@@ -60,6 +77,8 @@ def fetch_correlated_logs(
             results["pods_found"] = _extract_unique_pods(logs)
             print(f"  Found {len(logs)} log entries")
         except Exception as e:
+            if _is_splunk_unavailable(e):
+                return _mark_splunk_unavailable(results, e)
             results["errors"].append(f"Namespace query failed: {e}")
             print(f"  Query failed: {e}")
 
@@ -72,6 +91,8 @@ def fetch_correlated_logs(
             results["pods_found"] = _extract_unique_pods(logs)
             print(f"  Found {len(logs)} log entries")
         except Exception as e:
+            if _is_splunk_unavailable(e):
+                return _mark_splunk_unavailable(results, e)
             results["errors"].append(f"GUID query failed: {e}")
             print(f"  Query failed: {e}")
 
@@ -89,6 +110,8 @@ def fetch_correlated_logs(
             results["error_logs"] = _parse_ocp_logs(error_logs)
             print(f"  Found {len(error_logs)} error entries")
         except Exception as e:
+            if _is_splunk_unavailable(e):
+                return _mark_splunk_unavailable(results, e)
             results["errors"].append(f"Error query failed: {e}")
 
     return results

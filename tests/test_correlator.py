@@ -1,11 +1,7 @@
 import json
 from pathlib import Path
-from importlib.resources import files
 
-import jsonschema
 import pytest
-
-schemas_path = files("rca").joinpath("schemas")
 
 from rca.analysis.correlator import (
     _analyze_correlation,
@@ -13,13 +9,7 @@ from rca.analysis.correlator import (
     _parse_ocp_logs,
     build_correlation_timeline,
 )
-
-
-@pytest.fixture
-def correlation_schema():
-    schema_path = schemas_path.joinpath("correlation.schema.json")
-    with open(schema_path) as f:
-        return json.load(f)
+from rca.models import CorrelationTimeline
 
 
 @pytest.fixture
@@ -107,15 +97,14 @@ def test_extract_unique_pods_skips_invalid():
 # --- build_correlation_timeline tests ---
 
 
-def test_build_correlation_timeline_structure(correlation_schema, correlator_data):
-    """Test timeline construction and schema validation."""
+def test_build_correlation_timeline_structure(correlator_data):
+    """Test timeline construction and model validation."""
     job_context = correlator_data["timeline_context"]
     splunk_logs = correlator_data["timeline_splunk_logs"]
 
     timeline = build_correlation_timeline(job_context, splunk_logs)
 
-    # Validate schema
-    jsonschema.validate(instance=timeline, schema=correlation_schema)
+    CorrelationTimeline.model_validate(timeline)
 
     # Check events
     events = timeline["timeline_events"]

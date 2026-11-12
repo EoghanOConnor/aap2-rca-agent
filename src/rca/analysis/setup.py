@@ -619,7 +619,7 @@ def print_checks(results: list[dict]) -> int:
     issues = 0
 
     print()
-    print("RCA Skill Setup Status")
+    print("RCA Setup Status")
     print("=" * 60)
 
     for r in results:
