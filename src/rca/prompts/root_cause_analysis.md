@@ -15,11 +15,7 @@ Read these files from the job’s analysis directory:
 1. `step1_job_context.json` — required job metadata and failed task details.
 2. `step3_correlation.json` — required correlated timeline and pod logs.
 3. `step4_github_fetch_history.json` — required configuration and code context.
-4. `step4c_cost_estimate.json` — optional cost estimate of the failure, present
-   only if the cost step ran. Cite its figures exactly (estimate, range, `n`,
-   window, confidence), label them an estimate rather than billed cost, and never
-   recompute them or invent a figure when the file is absent.
-5. `step2_splunk_logs.json` — read only when Step 3 indicates that deeper log
+4. `step2_splunk_logs.json` — read only when Step 3 indicates that deeper log
    investigation is needed.
 
 If Step 2 is marked `skipped`, treat Splunk evidence as unavailable, do not
