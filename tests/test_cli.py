@@ -110,3 +110,18 @@ def test_upload_uses_configured_jumpbox_alias(monkeypatch, tmp_path: Path) -> No
         "unknown",
         ssh_jumpbox_alias="ci-jumpbox",
     )
+
+
+def test_setup_checks_reporting_mcp_token(monkeypatch) -> None:
+    from rca.analysis.setup import check_reporting_mcp
+
+    monkeypatch.delenv("REPORTING_MCP_TOKEN", raising=False)
+    missing = check_reporting_mcp()
+    assert missing["status"] == "missing"
+    assert missing["env_vars"][0]["name"] == "REPORTING_MCP_TOKEN"
+
+    monkeypatch.setenv("REPORTING_MCP_TOKEN", "<your-mcp-access-token>")
+    assert check_reporting_mcp()["status"] == "missing"
+
+    monkeypatch.setenv("REPORTING_MCP_TOKEN", "real-token")
+    assert check_reporting_mcp()["status"] == "ok"

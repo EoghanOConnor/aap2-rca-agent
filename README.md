@@ -131,6 +131,7 @@ Important settings include:
 - `REPORTING_MCP_TOKEN` (and optional `REPORTING_MCP_URL`) for the Step 4c cost
   estimate against the reporting database. Without a token the step is recorded
   as skipped. The Helm deployment does not set it by default.
+  `rca-analyze setup` checks that it is set.
 - `JUMPBOX_URI` for uploading completed analysis when using a direct SSH target.
 - Optional `SSH_JUMPBOX_ALIAS` to route uploads through a host configured in
   `~/.ssh/config` (the Helm cluster deployment uses `ci-jumpbox`). When set,
