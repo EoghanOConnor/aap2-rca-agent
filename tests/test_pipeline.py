@@ -71,3 +71,45 @@ def test_splunk_unavailable_skips_step_two(
 
     assert artifacts.splunk_logs["skipped"] is True
     assert "Name or service not known" in artifacts.splunk_logs["reason"]
+
+
+UUID = "123e4567-e89b-12d3-a456-426614174000"
+
+
+def test_cost_estimate_runs_as_step_4c(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    job_log = tmp_path / "job.json"
+    job_log.write_text(
+        '{"metadata": {"job_metadata": {"job_id": "1", "job_name": "RHPDS x-' + UUID + '-provision"}}}',
+        encoding="utf-8",
+    )
+    config = Config.from_env(
+        environment={"RCA_STATE_DIR": str(tmp_path), "REPORTING_MCP_TOKEN": "t"}
+    )
+    seen = {}
+
+    def fake_estimate(_mcp, uuid, include_baseline=False):
+        seen["uuid"] = uuid
+        return {"estimate": {"cost_mid": 1.0}}
+
+    monkeypatch.setattr("rca.analysis.pipeline.cost_estimate.connect", lambda _env: object())
+    monkeypatch.setattr("rca.analysis.pipeline.cost_estimate.estimate", fake_estimate)
+
+    artifacts = run_analysis(config=config, job_log=job_log, job_id="1")
+
+    assert seen["uuid"] == UUID
+    assert artifacts.cost_estimate == {"estimate": {"cost_mid": 1.0}}
+    assert (artifacts.analysis_dir / "step4c_cost_estimate.json").is_file()
+
+
+def test_cost_estimate_skipped_without_token(tmp_path) -> None:
+    job_log = tmp_path / "job.json"
+    job_log.write_text(
+        '{"metadata": {"job_metadata": {"job_id": "1", "job_name": "x-' + UUID + '"}}}',
+        encoding="utf-8",
+    )
+    config = Config.from_env(environment={"RCA_STATE_DIR": str(tmp_path)})
+
+    artifacts = run_analysis(config=config, job_log=job_log, job_id="1")
+
+    assert artifacts.cost_estimate["skipped"] is True
+    assert "REPORTING_MCP_TOKEN" in artifacts.cost_estimate["reason"]

@@ -16,6 +16,7 @@ from .bastion_resolver import (
     resolve_bastion_for_job,
     resolve_remote_log_dir,
 )
+from . import cost_estimate
 from .correlator import build_correlation_timeline, fetch_correlated_logs
 from .github_fetcher import GitHubAnalyzer, GitHubAuthenticationError, GitHubClient
 from .job_parser import parse_job_log
@@ -36,6 +37,10 @@ class AnalysisArtifacts:
     splunk_logs: dict[str, Any]
     correlation: dict[str, Any]
     github_fetch_history: dict[str, Any]
+    cost_estimate: dict[str, Any] | None = None
+
+
+COST_ESTIMATE_FILENAME = "step4c_cost_estimate.json"
 
 
 def get_step_name(step: int) -> str:
@@ -55,6 +60,44 @@ def save_step(analysis_dir: Path, step: int, data: dict[str, Any]) -> Path:
     with output_path.open("w", encoding="utf-8") as stream:
         json.dump(data, stream, indent=2, ensure_ascii=False, default=str)
     return output_path
+
+
+def run_cost_estimate(
+    config: Config,
+    job_context: dict[str, Any],
+    analysis_dir: Path,
+    *,
+    provision_uuid: str | None = None,
+    include_baseline: bool = False,
+) -> dict[str, Any]:
+    """Step 4c: estimate the failing provision's cost; never raises.
+
+    Returns the estimate, or ``{"skipped": True, "reason": ...}`` when no estimate
+    could be made (no token, no UUID, MCP failure). The result is saved either way.
+    """
+    uuid = provision_uuid or cost_estimate.provision_uuid_from_job_name(
+        str(job_context.get("job_name") or "")
+    )
+    if not uuid:
+        result: dict[str, Any] = {
+            "skipped": True,
+            "reason": f"No provision UUID in job name {job_context.get('job_name')!r}",
+        }
+    else:
+        try:
+            result = cost_estimate.estimate(
+                cost_estimate.connect(config.environment), uuid, include_baseline=include_baseline
+            )
+        except cost_estimate.CostEstimateError as exc:
+            result = {"skipped": True, "reason": str(exc)}
+        except Exception as exc:  # network/MCP failure: report, never guess a number
+            logger.warning("[Step 4c] cost estimate failed: %s: %s", type(exc).__name__, exc)
+            result = {"skipped": True, "reason": f"{type(exc).__name__}: {exc}"}
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    (analysis_dir / COST_ESTIMATE_FILENAME).write_text(
+        json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8"
+    )
+    return result
 
 
 def load_step(analysis_dir: Path, step: int) -> dict[str, Any] | None:
@@ -226,6 +269,8 @@ def run_analysis(
             raise AnalysisPipelineError(f"Error fetching GitHub files: {exc}") from exc
     save_step(analysis_dir, 4, github_fetch_history)
 
+    cost = run_cost_estimate(config, job_context, analysis_dir)
+
     return AnalysisArtifacts(
         job_id=parsed_job_id,
         analysis_dir=analysis_dir,
@@ -233,4 +278,5 @@ def run_analysis(
         splunk_logs=splunk_logs,
         correlation=correlation,
         github_fetch_history=github_fetch_history,
+        cost_estimate=cost,
     )
