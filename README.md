@@ -32,7 +32,7 @@ flowchart TD
     end
     Analysis --> Parse
     ReportingDB[(Reporting database<br/>reporting-db-prod MCP server)]
-    Cost -- "read-only SQL over HTTP<br/>REPORTING_MCP_TOKEN" --> ReportingDB
+    Cost --> ReportingDB
     Upload --> Aggregate[Semantic aggregation: historical matches and cross-job patterns]
     Known --> Aggregate
     Aggregate --> Write[Write report JSON]
