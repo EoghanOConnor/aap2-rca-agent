@@ -236,8 +236,45 @@ job gets its own result row. A cluster can therefore be read with a single
 equality query on `related_result_id` and does not require recursion.
 
 Per-job analysis files are saved under `$RCA_STATE_DIR/.analysis/{job_id}/`:
-job context, Splunk logs, the correlation timeline, GitHub fetch history, and
-the Step 5 analysis summary.
+job context, Splunk logs, the correlation timeline, GitHub fetch history, the
+Step 4c cost estimate, and the Step 5 analysis summary.
+
+## Cost estimate (Step 4c)
+
+`rca-analyze analyze` estimates what the failing provision cost and saves it as
+`step4c_cost_estimate.json`. The code is `src/rca/analysis/cost_estimate.py`;
+`rca-analyze cost --job-id <id> [--provision-uuid <uuid>] [--baseline]` re-runs
+just this step. Every number comes from SQL run through the `reporting-db-prod`
+MCP server; nothing is left to model judgement.
+
+```mermaid
+flowchart TD
+    Job[Job name in step1_job_context.json] --> UUID{Provision UUID found?}
+    UUID -- No --> Skip
+    UUID -- Yes --> Prov[Look up the provision: catalog item, provisioned_at, retired_at]
+    Prov --> Hours[hours_failing = retired_at - provisioned_at]
+    Prov --> Cmp[Comparison: successful provisions of the same catalog item,<br/>retired in the window before provisioned_at]
+    Cmp --> Enough{At least 3 matches?}
+    Enough -- "No, widen window 7 → 14 → 30 days" --> Cmp
+    Enough -- Yes --> Rate[Median, min and max cost per hour]
+    Enough -- "None at 30 days" --> Base[Catalog baseline: median cost per lifetime hour<br/>of recent provisions, outliers removed<br/>confidence always low]
+    Base --> Rate
+    Rate --> Cost["estimated cost = median cost per hour × hours_failing<br/>range = min / max cost per hour × hours_failing"]
+    Hours --> Cost
+    Cost --> Out[step4c_cost_estimate.json + summary line]
+    Skip["Skipped: no UUID, no REPORTING_MCP_TOKEN or MCP error<br/>saved as skipped with a reason; analysis continues"]
+```
+
+Confidence is `high` for 10 or more comparison provisions in the 7-day window,
+`medium` for 3 to 9, and `low` for a wider window, fewer than 3, or the catalog
+baseline. `provisioned_at` is a proxy for when the failure began, and the
+result is an estimate, not billed cost (cost data can lag a day or more). When
+the median equals the maximum the result is flagged as skewed and the high end
+is not a true upper bound.
+
+Set `REPORTING_MCP_TOKEN` (required; never commit it) and optionally
+`REPORTING_MCP_URL` to override the default endpoint. Without a token the step
+is recorded as skipped.
 
 ## Deployment and tests
 
