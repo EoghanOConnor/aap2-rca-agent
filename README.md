@@ -280,6 +280,10 @@ The result is an estimate, not billed cost (cost data can lag a day or more).
 When the median equals the maximum it is flagged as skewed and the high end is
 not a true upper bound.
 
+The batch synthesis agent reads `step4c_cost_estimate.json` as optional context
+and quotes it verbatim in its summary; it never computes a cost itself and the
+estimate does not influence the root cause or confidence.
+
 The step never fails the analysis: with no UUID, no `REPORTING_MCP_TOKEN`, or an
 MCP error, it saves `{"skipped": true, "reason": ...}` and continues.
 

@@ -18,8 +18,19 @@ Read these files from the job’s analysis directory:
 4. `step2_splunk_logs.json` — read only when Step 3 indicates that deeper log
    investigation is needed.
 
+5. `step4c_cost_estimate.json` — optional. A deterministic, SQL-derived estimate
+   of what the failing provision cost.
+
 If Step 2 is marked `skipped`, treat Splunk evidence as unavailable, do not
 retry it, and continue the synthesis from the remaining artifacts.
+
+Step 4c cost estimate: when the file exists and is not marked `skipped`, mention
+the estimated cost (with its range and `confidence`) in the impact or
+recommendation text, and say it is an estimate, not billed cost. Quote the
+numbers exactly as written in the file; never compute, adjust, or infer a cost
+yourself. If the file is missing or `skipped`, say the cost is unavailable and
+do not guess. The estimate is context only: it must not change the root cause
+or its confidence.
 
 Do not rerun Steps 1–4, fetch the job log again, mutate configuration or
 environment variables, or overwrite the deterministic artifacts. The only

@@ -211,3 +211,9 @@ def test_sdk_queries_propagate_unrelated_failures(
             )
         )
     assert raised.value is expected_error
+
+
+def test_synthesis_prompt_feeds_the_cost_estimate(tmp_path: Path) -> None:
+    prompt = orchestrator._synthesis_prompt("101", _artifacts(tmp_path))
+    assert "step4c_cost_estimate.json" in prompt
+    assert "step4c_cost_estimate.json" in orchestrator.RCA_INSTRUCTIONS

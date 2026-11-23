@@ -4,6 +4,10 @@ Investigate the failure and return the final structured summary grounded in
 these artifacts. Include the root cause, confidence, correlation identifiers,
 evidence, and actionable recommendations. Include the exact job ID `"$job_id"`.
 
+If `$analysis_dir/step4c_cost_estimate.json` exists, read it and report the
+estimated cost exactly as given, following the cost-estimate rules in your
+instructions.
+
 Every evidence entry requires `source`, `timestamp`, and `message`, including
 GitHub evidence. For configuration or code with no event timestamp in the
 artifacts, use `"timestamp": ""` to indicate that the time is unavailable;
