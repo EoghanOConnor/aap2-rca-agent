@@ -2,6 +2,7 @@
 
 from rca.models.batch import BatchReport, BatchSemanticOutput
 from rca.models.context import CorrelationTimeline, GitHubContext, JobContext
+from rca.models.cost import CostEstimate, CostEstimateArtifact
 from rca.models.summary import AnalysisSummary, RootCauseDetail
 
 __all__ = [
@@ -9,6 +10,8 @@ __all__ = [
     "BatchReport",
     "BatchSemanticOutput",
     "CorrelationTimeline",
+    "CostEstimate",
+    "CostEstimateArtifact",
     "GitHubContext",
     "JobContext",
     "RootCauseDetail",

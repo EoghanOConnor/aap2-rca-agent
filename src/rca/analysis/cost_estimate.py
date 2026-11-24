@@ -28,6 +28,10 @@ from typing import Any
 
 DEFAULT_URL = "https://reporting-mcp.apps.ocpv-infra01.dal12.infra.demo.redhat.com/mcp/"
 WINDOWS_DAYS = (7, 14, 30)
+# month_ts is the month a provision started, so the partition range must reach back past the
+# window by the longest lifetime we compare. Longer-lived provisions are excluded in SQL, so
+# the assumption is explicit rather than a silent drop.
+MAX_LIFETIME_DAYS = 90
 MIN_N = 3
 # Catalog baseline, adapted from demo-reporting
 # reporting-api/src/app/catalog_item/services/catalog_metrics.py
@@ -117,9 +121,9 @@ def comparison_stats(mcp, prov, days):
     t0 = str(prov["provisioned_at"])
     if not re.match(r"^\d{4}-\d{2}-\d{2}[ T][\d:.+-]+$", t0):
         raise ValueError(f"unexpected provisioned_at: {t0!r}")
-    # month_ts is the month a provision *started*, so reach back one more month
-    # than the window (the skill's fixed 37 days is too tight beyond 7 days).
-    lower = f"DATE_TRUNC('month', TIMESTAMP '{t0}' - interval '{days + 31} days')"
+    # month_ts is the month a provision *started*: reach back MAX_LIFETIME_DAYS past the window
+    # so every comparable provision, and all its cost partitions, fall inside the range.
+    lower = f"DATE_TRUNC('month', TIMESTAMP '{t0}' - interval '{days + MAX_LIFETIME_DAYS} days')"
     upper = f"DATE_TRUNC('month', TIMESTAMP '{t0}')"
     rows = mcp.query(f"""
         WITH cmp AS (
@@ -132,6 +136,7 @@ def comparison_stats(mcp, prov, days):
             AND p.provision_result = 'success'
             AND p.retired_at >= TIMESTAMP '{t0}' - interval '{days} days'
             AND p.retired_at <  TIMESTAMP '{t0}'
+            AND p.retired_at - p.provisioned_at <= interval '{MAX_LIFETIME_DAYS} days'
         ), cost AS (
           SELECT pc.provision_uuid, SUM(pc.total_cost) AS total_cost
           FROM provision_cost pc
@@ -313,6 +318,9 @@ def estimate(mcp, uuid: str, *, include_baseline: bool = False) -> dict[str, Any
             f"No estimate possible: no successful comparison provisions in {used} days "
             "before T0, and no catalog baseline."
         )
+        # Marked skipped so consumers that gate on `skipped` never see a null estimate.
+        result["skipped"] = True
+        result["reason"] = result["note"]
         return result
 
     med, lo, hi = (float(rates[k]) for k in ("median_per_hr", "min_per_hr", "max_per_hr"))

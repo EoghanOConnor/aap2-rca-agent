@@ -117,11 +117,11 @@ def test_setup_checks_reporting_mcp_token(monkeypatch) -> None:
 
     monkeypatch.delenv("REPORTING_MCP_TOKEN", raising=False)
     missing = check_reporting_mcp()
-    assert missing["status"] == "missing"
+    assert missing["status"] == "skipped"
     assert missing["env_vars"][0]["name"] == "REPORTING_MCP_TOKEN"
 
     monkeypatch.setenv("REPORTING_MCP_TOKEN", "<your-mcp-access-token>")
-    assert check_reporting_mcp()["status"] == "missing"
+    assert check_reporting_mcp()["status"] == "skipped"
 
     monkeypatch.setenv("REPORTING_MCP_TOKEN", "real-token")
     assert check_reporting_mcp()["status"] == "ok"

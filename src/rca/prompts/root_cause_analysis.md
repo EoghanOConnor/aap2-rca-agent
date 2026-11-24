@@ -24,11 +24,12 @@ Read these files from the job’s analysis directory:
 If Step 2 is marked `skipped`, treat Splunk evidence as unavailable, do not
 retry it, and continue the synthesis from the remaining artifacts.
 
-Step 4c cost estimate: when the file exists and is not marked `skipped`, mention
+Step 4c cost estimate: when the file exists, is not marked `skipped`, and its
+`estimate` is not null, mention
 the estimated cost (with its range and `confidence`) in the impact or
 recommendation text, and say it is an estimate, not billed cost. Quote the
 numbers exactly as written in the file; never compute, adjust, or infer a cost
-yourself. If the file is missing or `skipped`, say the cost is unavailable and
+yourself. If the file is missing, `skipped`, or has a null `estimate`, say the cost is unavailable and
 do not guess. The estimate is context only: it must not change the root cause
 or its confidence.
 

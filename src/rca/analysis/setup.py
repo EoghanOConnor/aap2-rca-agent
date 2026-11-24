@@ -283,7 +283,7 @@ def check_reporting_mcp() -> dict:
     if is_placeholder(token):
         return {
             "name": "Reporting MCP token",
-            "status": "missing",
+            "status": "skipped",  # optional: does not fail setup
             "message": (
                 "REPORTING_MCP_TOKEN not configured; the cost estimate (Step 4c) will be "
                 "skipped. Set in .claude/settings.json"
@@ -644,7 +644,7 @@ def run_checks(base_dir: Path, repo_root: Path | None = None) -> list[dict]:
 
 def print_checks(results: list[dict]) -> int:
     """Print check results in a human-readable format. Returns count of issues."""
-    icons = {"ok": "[ok]", "missing": "[!!]", "error": "[!!]"}
+    icons = {"ok": "[ok]", "skipped": "[--]", "missing": "[!!]", "error": "[!!]"}
     issues = 0
 
     print()
@@ -655,7 +655,7 @@ def print_checks(results: list[dict]) -> int:
         icon = icons.get(r["status"], "[??]")
         pad = 20 - len(r["name"])
         print(f"  {icon} {r['name']}{' ' * max(pad, 1)} {r['message']}")
-        if r["status"] != "ok":
+        if r["status"] not in ("ok", "skipped"):
             issues += 1
 
     print()

@@ -131,7 +131,7 @@ Important settings include:
 - `REPORTING_MCP_TOKEN` (and optional `REPORTING_MCP_URL`) for the Step 4c cost
   estimate against the reporting database. Without a token the step is recorded
   as skipped. The Helm deployment does not set it by default.
-  `rca-analyze setup` checks that it is set.
+  `rca-analyze setup` reports whether it is set but does not fail without it.
 - `JUMPBOX_URI` for uploading completed analysis when using a direct SSH target.
 - Optional `SSH_JUMPBOX_ALIAS` to route uploads through a host configured in
   `~/.ssh/config` (the Helm cluster deployment uses `ci-jumpbox`). When set,
@@ -142,9 +142,10 @@ Important settings include:
 Batch reports are written to `$RCA_STATE_DIR/reports/`. Per-job artifacts are
 stored under `$RCA_STATE_DIR/.analysis/{job_id}/`.
 
-`rca.models` provides Pydantic models for all seven JSON artifact contracts.
+`rca.models` provides Pydantic models for all eight JSON artifact contracts.
 These define generated summaries, raw semantic aggregation responses, final
-batch reports, and assembled root-cause details. Per-job synthesis and semantic
+batch reports, assembled root-cause details, and the Step 4c cost estimate
+(`CostEstimateArtifact`). Per-job synthesis and semantic
 aggregation derive response schemas from `AnalysisSummary` and
 `BatchSemanticOutput` with `model_json_schema()` and pass them to the Agent SDK. There are
 no separately maintained JSON schema files. Models preserve rules for required

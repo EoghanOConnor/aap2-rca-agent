@@ -156,7 +156,7 @@ def cmd_setup(config: Config, as_json: bool) -> int:
     else:
         issues = print_checks(results)
         return 0 if issues == 0 else 1
-    return 0 if all(item["status"] == "ok" for item in results) else 1
+    return 0 if all(item["status"] in ("ok", "skipped") for item in results) else 1
 
 
 def _run_mlflow_autolog(project_root: Path, environment: dict[str, str]) -> None:

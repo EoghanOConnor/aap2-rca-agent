@@ -1,7 +1,9 @@
 import pytest
+from pydantic import ValidationError
 
 from rca.analysis import cost_estimate as pce
 from rca.analysis import cli
+from rca.models.cost import CostEstimateArtifact
 
 
 @pytest.mark.parametrize(
@@ -35,7 +37,8 @@ def test_month_ts_bound_scales_with_window(days):
     prov = {"uuid": "abc-123", "catalog_id": 42, "provisioned_at": "2026-10-29 19:33:17"}
     pce.comparison_stats(mcp, prov, days)
     sql = mcp.sql[0]
-    assert f"interval '{days + 31} days'" in sql
+    assert f"interval '{days + pce.MAX_LIFETIME_DAYS} days'" in sql
+    assert f"p.retired_at - p.provisioned_at <= interval '{pce.MAX_LIFETIME_DAYS} days'" in sql
     assert f"interval '{days} days'" in sql
     assert "p.catalog_id = 42" in sql
 
@@ -169,7 +172,17 @@ def test_estimate_without_data_reports_no_estimate():
 
     out = pce.estimate(NoData({}), "abc12345-1234")
     assert out["estimate"] is None
+    assert out["skipped"] is True and "No estimate possible" in out["reason"]
     assert "No estimate possible" in pce.render(out)
+    CostEstimateArtifact.model_validate(out)
+
+
+def test_artifact_model_accepts_estimate_and_skipped():
+    mcp = ScriptedMCP({"n": 12, "median_per_hr": "2", "min_per_hr": "1", "max_per_hr": "4"})
+    CostEstimateArtifact.model_validate(pce.estimate(mcp, "abc12345-1234"))
+    CostEstimateArtifact.model_validate({"skipped": True, "reason": "no token"})
+    with pytest.raises(ValidationError):
+        CostEstimateArtifact.model_validate({"skipped": True})
 
 
 def test_estimate_rejects_bad_uuid_and_missing_provision():
